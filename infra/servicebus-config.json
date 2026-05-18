@@ -1,0 +1,25 @@
+{
+  "UserConfig": {
+    "Namespaces": [
+      {
+        "Name": "clinical-local",
+        "Queues": [
+          {
+            "Name": "report-requests",
+            "Properties": {
+              "DeadLetteringOnMessageExpiration": true,
+              "DefaultMessageTimeToLive": "PT1H",
+              "LockDuration": "PT1M",
+              "MaxDeliveryCount": 3,
+              "RequiresSession": false
+            }
+          }
+        ],
+        "Topics": []
+      }
+    ],
+    "Logging": {
+      "Type": "File"
+    }
+  }
+}

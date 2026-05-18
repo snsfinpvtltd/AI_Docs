@@ -1,0 +1,127 @@
+############################
+# .NET
+############################
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vs/
+_ReSharper*/
+*.ReSharper
+*.DotSettings.user
+project.lock.json
+project.fragment.lock.json
+artifacts/
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+packages/
+!**/packages/repositories.config
+
+# Publish output
+publish/
+*.pubxml.user
+
+############################
+# Secrets & local config
+############################
+appsettings.Development.json
+appsettings.Staging.json
+local.settings.json
+secrets.json
+**/.secrets/
+*.pfx
+*.p12
+
+############################
+# Azure Functions
+############################
+__blobstorage__/
+__queuestorage__/
+__azurite_db*__/
+.Azurite/
+
+############################
+# Azure
+############################
+.azure/
+*.azureauth
+
+############################
+# Node / npm
+############################
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnp/
+.pnp.js
+.yarn/
+
+# Build output
+dist/
+dist-ssr/
+build/
+.cache/
+.parcel-cache/
+
+# Env files — keep .env.local out of git
+.env
+.env.*
+!.env.example
+
+# TypeScript
+*.tsbuildinfo
+
+# Vite
+vite.config.ts.timestamp-*
+
+############################
+# Playwright
+############################
+/playwright/.cache/
+/playwright-report/
+/test-results/
+blob-report/
+
+############################
+# Coverage
+############################
+coverage/
+*.lcov
+.nyc_output/
+
+############################
+# Editors
+############################
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json.template
+.idea/
+*.vsix
+.history/
+*.swp
+*~
+
+############################
+# OS
+############################
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/

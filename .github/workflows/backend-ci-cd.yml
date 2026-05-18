@@ -1,0 +1,62 @@
+name: Backend CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/ClinicalAgent.Api/**'
+      - 'src/ClinicalAgent.Plugins/**'
+      - 'src/ClinicalAgent.Core/**'
+      - 'ClinicalAgent.sln'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-test-deploy:
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore ClinicalAgent.sln
+
+      - name: Build
+        run: dotnet build ClinicalAgent.sln --no-restore -c Release
+
+      - name: Test
+        run: |
+          dotnet test tests/ClinicalAgent.Plugins.Tests/ClinicalAgent.Plugins.Tests.csproj \
+            --no-build -c Release --logger trx --results-directory TestResults
+          dotnet test tests/ClinicalAgent.Api.Tests/ClinicalAgent.Api.Tests.csproj \
+            --no-build -c Release --logger trx --results-directory TestResults
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build & push to ACR
+        run: |
+          az acr build \
+            --registry ${{ secrets.ACR_NAME }} \
+            --image clinical-agent-api:${{ github.sha }} \
+            --file src/ClinicalAgent.Api/Dockerfile \
+            .
+
+      - name: Deploy to Container App
+        run: |
+          az containerapp update \
+            --name ${{ secrets.CONTAINER_APP_NAME }} \
+            --resource-group ${{ secrets.RESOURCE_GROUP }} \
+            --image ${{ secrets.ACR_NAME }}.azurecr.io/clinical-agent-api:${{ github.sha }}
