@@ -189,7 +189,7 @@ internal sealed class LocalReportOrchestrator : IReportOrchestrator
                 }
 
                 allRows.Add(Enumerable.Range(1, headers.Count)
-                    .Select(c => row.Cell(c).GetValue<string>())
+                    .Select(c => GetCellString(row.Cell(c)))
                     .ToList());
             }
         }
@@ -200,6 +200,20 @@ internal sealed class LocalReportOrchestrator : IReportOrchestrator
                 "please re-upload your Excel file(s) on the Upload Data page and try again.");
 
         return new ParsedData(request.TemplateType, headers, allRows, request.FreeTextPrompt);
+    }
+
+    /// <summary>
+    /// Returns the string representation of a cell value, normalising date-typed cells
+    /// to "yyyy-MM-dd" so NaturalLanguageFilter can reliably parse them.
+    /// </summary>
+    private static string GetCellString(IXLCell cell)
+    {
+        if (cell.DataType == XLDataType.DateTime)
+        {
+            try { return cell.GetValue<DateTime>().ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture); }
+            catch { }
+        }
+        return cell.GetValue<string>();
     }
 
     // ── Document dispatch ─────────────────────────────────────────────────────

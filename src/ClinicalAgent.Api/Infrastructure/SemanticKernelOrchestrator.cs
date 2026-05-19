@@ -189,7 +189,7 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
             using var workbook = new XLWorkbook(fetchResult.Value);
             var ws = workbook.Worksheets.First();
 
-            var fileHeaders = ws.Row(1).CellsUsed().Select(c => c.GetValue<string>()).ToList();
+            var fileHeaders = ws.Row(1).CellsUsed().Select(c => c.GetValue<string>()).ToList(); // headers are always text
 
             if (headers is null)
             {
@@ -211,7 +211,7 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
                 }
 
                 allRows.Add(Enumerable.Range(1, headers.Count)
-                    .Select(c => row.Cell(c).GetValue<string>())
+                    .Select(c => GetCellString(row.Cell(c)))
                     .ToList());
             }
         }
@@ -490,6 +490,20 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
         if (from is null) return $"up to {to:yyyy-MM-dd}";
         if (to is null)   return $"from {from:yyyy-MM-dd}";
         return $"{from:yyyy-MM-dd} to {to:yyyy-MM-dd}";
+    }
+
+    /// <summary>
+    /// Returns the string representation of a cell value, normalising date-typed cells
+    /// to "yyyy-MM-dd" so NaturalLanguageFilter can reliably parse them.
+    /// </summary>
+    private static string GetCellString(IXLCell cell)
+    {
+        if (cell.DataType == XLDataType.DateTime)
+        {
+            try { return cell.GetValue<DateTime>().ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture); }
+            catch { }
+        }
+        return cell.GetValue<string>();
     }
 
     private static string ExtractJson(string raw)
