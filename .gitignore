@@ -5,6 +5,14 @@
 [Oo]bj/
 [Ll]og/
 [Ll]ogs/
+
+# Local dev blob store (survives restarts, not committed)
+.blobstore/
+
+# SQLite dev database
+*.db
+*.db-shm
+*.db-wal
 *.user
 *.suo
 *.userosscache
@@ -125,3 +133,4 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
+.gitignore

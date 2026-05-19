@@ -1,4 +1,7 @@
+using ClinicalAgent.Api.Data;
+using ClinicalAgent.Api.Infrastructure;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.EntityFrameworkCore;
 
 namespace ClinicalAgent.Api.Controllers;
 
@@ -9,11 +12,19 @@ namespace ClinicalAgent.Api.Controllers;
 public class ReportsController : ControllerBase
 {
     private readonly IReportOrchestrator _orchestrator;
+    private readonly IBlobStorageService _storage;
+    private readonly AppDbContext        _db;
     private readonly ILogger<ReportsController> _logger;
 
-    public ReportsController(IReportOrchestrator orchestrator, ILogger<ReportsController> logger)
+    public ReportsController(
+        IReportOrchestrator orchestrator,
+        IBlobStorageService storage,
+        AppDbContext db,
+        ILogger<ReportsController> logger)
     {
         _orchestrator = orchestrator;
+        _storage      = storage;
+        _db           = db;
         _logger       = logger;
     }
 
@@ -30,32 +41,103 @@ public class ReportsController : ControllerBase
         [FromBody] ReportRequest request,
         CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(request.BlobName))
-            return BadRequest(Problem("BlobName is required.", statusCode: 400));
-
         if (string.IsNullOrWhiteSpace(request.TemplateType))
-            return BadRequest(Problem("TemplateType is required.", statusCode: 400));
+            return Problem("TemplateType is required.", statusCode: 400);
 
         var userId = User.FindFirst("oid")?.Value ?? User.FindFirst("sub")?.Value ?? "anonymous";
 
+        // Resolve which blobs to include: a specific file or every upload by this user.
+        List<string> blobNames;
+        if (!string.IsNullOrWhiteSpace(request.BlobName))
+        {
+            blobNames = [request.BlobName];
+        }
+        else
+        {
+            blobNames = await _db.Uploads
+                .Where(u => u.UserId == userId)
+                .OrderByDescending(u => u.UploadedAt)
+                .Select(u => u.BlobName)
+                .ToListAsync(cancellationToken);
+
+            if (blobNames.Count == 0)
+                return Problem(
+                    "No uploaded files found. Please upload an Excel file first.", statusCode: 400);
+        }
+
+        var enrichedRequest = request with { BlobNames = blobNames };
+
         try
         {
-            var result = await _orchestrator.SubmitAsync(request, userId, cancellationToken);
+            var result = await _orchestrator.SubmitAsync(enrichedRequest, userId, cancellationToken);
 
             return result.Match<ActionResult<ReportSubmitResult>>(
                 onSuccess: v => Ok(v),
                 onFailure: err =>
                 {
                     _logger.LogWarning("Report submission failed for user {UserId}: {Error}", userId, err);
-                    return UnprocessableEntity(Problem(err, statusCode: 422));
+                    return Problem(err, statusCode: 422);
                 });
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Unexpected error submitting report for user {UserId}", userId);
-            return StatusCode(StatusCodes.Status500InternalServerError,
-                Problem("An unexpected error occurred. Please try again.", statusCode: 500));
+            return Problem("An unexpected error occurred. Please try again.", statusCode: 500);
         }
+    }
+
+    /// <summary>Downloads the generated report file for the given job ID.</summary>
+    [HttpGet("{jobId}/download")]
+    [AllowAnonymous]
+    [ProducesResponseType(typeof(FileStreamResult), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> DownloadReport(
+        string jobId,
+        [FromQuery] string format = "docx",
+        CancellationToken cancellationToken = default)
+    {
+        var (mime, ext) = format switch
+        {
+            "xlsx" => ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"),
+            "pdf"  => ("application/pdf", "pdf"),
+            _      => ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"),
+        };
+
+        var result = await _storage.DownloadAsync(BlobContainerNames.Generated, $"{jobId}.{ext}", cancellationToken);
+
+        if (!result.IsSuccess)
+        {
+            _logger.LogWarning("Download requested for missing report {JobId}.{Ext}", jobId, ext);
+            return Problem($"Report '{jobId}' not found or has expired.", statusCode: 404);
+        }
+
+        return File(result.Value, mime, $"report-{jobId}.{ext}");
+    }
+
+    /// <summary>Returns report job history for the authenticated user, newest first.</summary>
+    [HttpGet("history")]
+    [ProducesResponseType(typeof(IReadOnlyList<ReportJobSummary>), StatusCodes.Status200OK)]
+    public async Task<ActionResult<IReadOnlyList<ReportJobSummary>>> GetHistory(
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 20,
+        CancellationToken cancellationToken = default)
+    {
+        var userId = User.FindFirst("oid")?.Value ?? User.FindFirst("sub")?.Value ?? "anonymous";
+        pageSize = Math.Clamp(pageSize, 1, 100);
+        page     = Math.Max(page, 1);
+
+        var records = await _db.ReportJobs
+            .Where(j => j.UserId == userId)
+            .OrderByDescending(j => j.CreatedAt)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(cancellationToken);
+
+        var result = records.Select(j => new ReportJobSummary(
+            j.Id, j.TemplateType, j.OutputFormat, j.Status,
+            j.CreatedAt, j.CompletedAt, j.DownloadUrl, j.RowCount, j.PromptText)).ToList();
+
+        return Ok(result);
     }
 
     /// <summary>Polls the status of an async report job. Returns the download URL once complete.</summary>
@@ -68,7 +150,7 @@ public class ReportsController : ControllerBase
         CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(jobId))
-            return BadRequest(Problem("jobId is required.", statusCode: 400));
+            return Problem("jobId is required.", statusCode: 400);
 
         try
         {
@@ -79,14 +161,13 @@ public class ReportsController : ControllerBase
                 onFailure: err =>
                 {
                     _logger.LogWarning("Status lookup failed for job {JobId}: {Error}", jobId, err);
-                    return NotFound(Problem($"Job '{jobId}' not found.", statusCode: 404));
+                    return Problem($"Job '{jobId}' not found.", statusCode: 404);
                 });
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Unexpected error polling status for job {JobId}", jobId);
-            return StatusCode(StatusCodes.Status500InternalServerError,
-                Problem("An unexpected error occurred. Please try again.", statusCode: 500));
+            return Problem("An unexpected error occurred. Please try again.", statusCode: 500);
         }
     }
 }

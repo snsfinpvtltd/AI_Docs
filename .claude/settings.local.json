@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dotnet restore)",
+      "Bash(npx tsc *)",
+      "Bash(npm run *)",
+      "Bash(dotnet run *)",
+      "PowerShell($excel = New-Object -ComObject Excel.Application -ErrorAction SilentlyContinue; if \\($excel\\) { $excel.Quit\\(\\); \"Excel available\" } else { \"No Excel COM\" })",
+      "PowerShell(dotnet build src\\\\ClinicalAgent.Api\\\\ClinicalAgent.Api.csproj -c Debug --nologo -v quiet 2>&1)",
+      "PowerShell(Start-Process -FilePath \"dotnet\" -ArgumentList \"run\",\"--project\",\"src\\\\ClinicalAgent.Api\",\"--launch-profile\",\"http\",\"--no-build\" -NoNewWindow -PassThru)",
+      "Bash(wait)",
+      "Bash(exit 0)",
+      "PowerShell(Stop-Process *)",
+      "Bash(claude auth *)",
+      "Bash(dotnet build *)",
+      "Bash(echo \"Backend starting in background \\(PID: $!\\)\")",
+      "Bash(curl -s http://localhost:7001/health)",
+      "Bash(Get-Process -Name \"ClinicalAgent.Api\" -ErrorAction SilentlyContinue)",
+      "Bash(Select-Object Id, Name)",
+      "PowerShell(Get-Process -Name \"ClinicalAgent.Api\" -ErrorAction SilentlyContinue)",
+      "PowerShell(Start-Process -FilePath \"dotnet\" -ArgumentList \"run\",\"--project\",\"src/ClinicalAgent.Api\",\"--launch-profile\",\"http\" -WorkingDirectory \"d:\\\\Projects\\\\2026-2027\\\\AI_Docs\" -WindowStyle Minimized)",
+      "PowerShell(\\(Invoke-WebRequest \"http://localhost:5173/src/auth/AuthContext.tsx\" -UseBasicParsing\\).Content | Select-String \"throw|Error\\\\\\(\" | Select-Object -First 10)"
+    ]
+  }
+}

@@ -32,9 +32,11 @@ export const msalInstance = new PublicClientApplication(msalConfig)
 
 /**
  * Scopes requested when acquiring tokens for the backend API.
- * Update VITE_AZURE_CLIENT_ID to the backend API's app registration client ID
- * once it has been registered in Azure Entra ID.
+ * Set VITE_AZURE_API_SCOPE in .env.local to the full scope URI exposed by the
+ * backend App Registration (e.g. api://<api-client-id>/access_as_user).
+ * The App Registration must have "Expose an API" configured in Azure Entra ID
+ * with that Application ID URI and scope name before this will work.
  */
 export const apiScopes: { scopes: string[] } = {
-  scopes: [`api://${import.meta.env.VITE_AZURE_CLIENT_ID}/access_as_user`],
+  scopes: [import.meta.env.VITE_AZURE_API_SCOPE],
 }

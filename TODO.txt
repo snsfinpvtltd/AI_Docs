@@ -1,3 +1,6 @@
 Create docker-compose.yml in the project root with
 Azurite, Service Bus Emulator, and SQL Server 2022
 as defined in CLAUDE.md
+
+step 2 : 
+docker compose up -d

@@ -1,9 +1,16 @@
+using System.Text;
+using System.Text.Json.Serialization;
 using Azure.Identity;
 using Azure.Messaging.ServiceBus;
 using Azure.Storage.Blobs;
+using ClinicalAgent.Api.Data;
 using ClinicalAgent.Api.Infrastructure;
 using ClinicalAgent.Core.Interfaces;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Identity.Web;
+using Microsoft.IdentityModel.Tokens;
 using Microsoft.SemanticKernel;
 using Serilog;
 using Serilog.Events;
@@ -24,10 +31,52 @@ try
         .Enrich.FromLogContext()
         .WriteTo.Console());
 
-    // ── Auth ─────────────────────────────────────────────────────────────────
+    // ── Auth — Microsoft Entra ID (primary) ──────────────────────────────────
     // Requires AzureAd:TenantId + AzureAd:ClientId in appsettings.Development.json.
     builder.Services.AddMicrosoftIdentityWebApiAuthentication(builder.Configuration);
-    builder.Services.AddAuthorization();
+
+    // ── Auth — Social providers (Google / GitHub token exchange) ─────────────
+    // LocalJwtService issues HS256 tokens when Jwt:Secret is configured.
+    // These are validated by the "Social" bearer scheme below.
+    builder.Services.AddSingleton<LocalJwtService>();
+
+    var jwtSecret = builder.Configuration["Jwt:Secret"];
+    if (!string.IsNullOrWhiteSpace(jwtSecret))
+    {
+        builder.Services.AddAuthentication()
+            .AddJwtBearer("Social", options =>
+            {
+                options.TokenValidationParameters = new TokenValidationParameters
+                {
+                    ValidIssuer              = "ClinicalAgent",
+                    ValidAudience            = "ClinicalAgent",
+                    IssuerSigningKey         = new SymmetricSecurityKey(
+                                                  Encoding.UTF8.GetBytes(jwtSecret)),
+                    ValidateIssuerSigningKey = true,
+                    ValidateIssuer           = true,
+                    ValidateAudience         = true,
+                    ClockSkew                = TimeSpan.FromMinutes(5),
+                };
+            });
+
+        // Accept tokens from either Azure AD or the social-login scheme.
+        builder.Services.AddAuthorization(opts =>
+        {
+            var multiSchemePolicy = new AuthorizationPolicyBuilder(
+                    JwtBearerDefaults.AuthenticationScheme, "Social")
+                .RequireAuthenticatedUser()
+                .Build();
+
+            opts.DefaultPolicy  = multiSchemePolicy;
+            opts.FallbackPolicy = multiSchemePolicy;
+        });
+    }
+    else
+    {
+        builder.Services.AddAuthorization();
+        Log.Warning("Jwt:Secret not configured — social sign-in (Google/GitHub) will return 500. " +
+                    "Add Jwt:Secret to appsettings.Development.json.");
+    }
 
     // ── Application Insights ─────────────────────────────────────────────────
     // Telemetry is shipped via Serilog.Sinks.ApplicationInsights configured in appsettings.json.
@@ -57,24 +106,53 @@ try
     else if (!string.IsNullOrWhiteSpace(sbNamespace))
         builder.Services.AddSingleton(new ServiceBusClient(sbNamespace, new DefaultAzureCredential()));
 
-    // ── Semantic Kernel ──────────────────────────────────────────────────────
-    var kernelBuilder = builder.Services.AddKernel();
-    var aoaiEndpoint  = builder.Configuration["AzureOpenAI:Endpoint"];
+    // ── Semantic Kernel + AI provider ────────────────────────────────────────
+    // Priority: Groq (free dev) → Azure OpenAI (production) → none (raw data only)
+    var kernelBuilder  = builder.Services.AddKernel();
+    var groqApiKey     = builder.Configuration["Groq:ApiKey"];
+    var aoaiEndpoint   = builder.Configuration["AzureOpenAI:Endpoint"];
+    var aoaiDeployment = builder.Configuration["AzureOpenAI:DeploymentName"] ?? "gpt-4o";
+    var aoaiApiKey     = builder.Configuration["AzureOpenAI:ApiKey"];
 
-    if (!string.IsNullOrWhiteSpace(aoaiEndpoint))
+    var aiConfigured = false;
+
+    if (!string.IsNullOrWhiteSpace(groqApiKey))
     {
-        kernelBuilder.AddAzureOpenAIChatCompletion(
-            deploymentName: builder.Configuration["AzureOpenAI:DeploymentName"] ?? "gpt-4o",
-            endpoint:       aoaiEndpoint,
-            credentials:    new DefaultAzureCredential());
+        // Groq: OpenAI-compatible, free tier — ideal for dev/POC.
+        kernelBuilder.AddOpenAIChatCompletion(
+            modelId:    "llama-3.3-70b-versatile",
+            apiKey:     groqApiKey,
+            httpClient: new HttpClient { BaseAddress = new Uri("https://api.groq.com/openai/v1/") });
+        aiConfigured = true;
+        Log.Information("AI provider: Groq (llama-3.3-70b-versatile)");
+    }
+    else if (!string.IsNullOrWhiteSpace(aoaiEndpoint))
+    {
+        // Azure OpenAI: production path — API key for dev convenience, DefaultAzureCredential for prod.
+        if (!string.IsNullOrWhiteSpace(aoaiApiKey))
+            kernelBuilder.AddAzureOpenAIChatCompletion(aoaiDeployment, aoaiEndpoint, aoaiApiKey);
+        else
+            kernelBuilder.AddAzureOpenAIChatCompletion(aoaiDeployment, aoaiEndpoint, new DefaultAzureCredential());
+        aiConfigured = true;
+        Log.Information("AI provider: Azure OpenAI ({Deployment})", aoaiDeployment);
+    }
+    else
+    {
+        Log.Warning("No AI provider configured — reports will use local data formatting. " +
+                    "Set Groq:ApiKey in appsettings.Development.json to enable AI-generated reports.");
     }
 
     // ── Domain services ───────────────────────────────────────────────────────
-    // TODO: replace stubs with real implementations from ClinicalAgent.Plugins
-    builder.Services.AddScoped<IBlobStorageService,  StubBlobStorageService>();
-    builder.Services.AddScoped<IServiceBusPublisher, StubServiceBusPublisher>();
-    builder.Services.AddScoped<IReportOrchestrator,  StubReportOrchestrator>();
-    builder.Services.AddScoped<ITemplateRepository,  StubTemplateRepository>();
+    // Singleton so the in-memory blob store and job dictionary survive across requests.
+    builder.Services.AddSingleton<IBlobStorageService,  StubBlobStorageService>();
+    builder.Services.AddSingleton<IServiceBusPublisher, StubServiceBusPublisher>();
+    builder.Services.AddSingleton<ITemplateRepository,  StubTemplateRepository>();
+
+    // Use AI orchestrator when a provider is configured; fall back to raw data formatting.
+    if (aiConfigured)
+        builder.Services.AddSingleton<IReportOrchestrator, SemanticKernelOrchestrator>();
+    else
+        builder.Services.AddSingleton<IReportOrchestrator, LocalReportOrchestrator>();
 
     // ── HTTP resilience (Polly) ───────────────────────────────────────────────
     // Provides 3 retries with exponential backoff on all named HttpClient usages.
@@ -82,7 +160,9 @@ try
         .AddStandardResilienceHandler();
 
     // ── MVC / Swagger ─────────────────────────────────────────────────────────
-    builder.Services.AddControllers();
+    builder.Services.AddControllers()
+        .AddJsonOptions(opts =>
+            opts.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter()));
     builder.Services.AddEndpointsApiExplorer();
     builder.Services.AddSwaggerGen(c =>
     {
@@ -90,17 +170,40 @@ try
     });
     builder.Services.AddProblemDetails();
 
+    // ── SQLite database ──────────────────────────────────────────────────────
+    // Dev:  Database:Path = "clinicalagent.db"  (SQLite file in working dir)
+    // Prod: swap UseSqlite for UseSqlServer / UseNpgsql + add the matching NuGet package.
+    var dbPath = builder.Configuration["Database:Path"] ?? "clinicalagent.db";
+
+    builder.Services.AddDbContextFactory<AppDbContext>(opts =>
+        opts.UseSqlite($"Data Source={dbPath}"));
+
+    // Also register as scoped so controllers can inject AppDbContext directly.
+    builder.Services.AddDbContext<AppDbContext>(opts =>
+        opts.UseSqlite($"Data Source={dbPath}"));
+
     // ── Health checks ────────────────────────────────────────────────────────
     builder.Services.AddHealthChecks();
 
     // ── CORS ─────────────────────────────────────────────────────────────────
     builder.Services.AddCors(opt => opt.AddPolicy("LocalDev", policy =>
-        policy.WithOrigins("http://localhost:5173")
+        policy.SetIsOriginAllowed(origin =>
+                  Uri.TryCreate(origin, UriKind.Absolute, out var u) &&
+                  u.Host == "localhost" &&
+                  (u.Scheme == "http" || u.Scheme == "https"))
               .AllowAnyHeader()
               .AllowAnyMethod()));
 
     // ─────────────────────────────────────────────────────────────────────────
     var app = builder.Build();
+
+    // Auto-create SQLite schema on startup (no migrations needed for POC).
+    using (var scope = app.Services.CreateScope())
+    {
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        db.Database.EnsureCreated();
+        Log.Information("Database ready: {DbPath}", dbPath);
+    }
 
     if (app.Environment.IsDevelopment())
     {
@@ -110,7 +213,8 @@ try
     }
 
     app.UseSerilogRequestLogging();
-    app.UseHttpsRedirection();
+    if (!app.Environment.IsDevelopment())
+        app.UseHttpsRedirection();
     app.UseAuthentication();
     app.UseAuthorization();
     app.MapControllers();
