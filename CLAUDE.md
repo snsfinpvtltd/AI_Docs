@@ -237,6 +237,13 @@ API startup log confirms which path was taken:
 - System prompt must instruct the model to return ONLY a JSON object — no markdown fences, no extra text.
 - `ExtractJson()` strips markdown code fences and extracts the first `{…}` block as a safety net for non-compliant responses.
 
+### NL filter rules
+- `NaturalLanguageFilter` is a **static class** — no DI, no LLM dependency. Both orchestrators call it.
+- The AI filter fallback (`ParseAndApplyFiltersAsync`) lives only in `SemanticKernelOrchestrator` and uses Temperature=0, MaxTokens=400 — keep it cheap.
+- Never send data rows to the LLM for filtering — only send column headers + the user prompt. The LLM extracts intent as structured JSON; we apply predicates ourselves.
+- `ApplyAiFilters` does fuzzy column lookup: exact name first, then strip underscores/hyphens, then substring containment — handles "TrialID" vs "Trial_ID" vs "Trial ID".
+- When adding new filter operators to `NaturalLanguageFilter`, list longer multi-word alternatives **before** shorter ones in the regex alternation so the greedy engine picks the longest match first (e.g. `no\s+more\s+than` before `more\s+than`).
+
 ### Service lifetime — critical
 - `StubBlobStorageService`, `StubServiceBusPublisher`, `StubTemplateRepository`, and the report orchestrator are all **Singleton**.
 - Never use `Scoped` for these — blobs uploaded in one request are lost by the next request if the store is scoped.
@@ -292,27 +299,39 @@ API startup log confirms which path was taken:
    b. ParseExcel() with ClosedXML:
       - read headers from row 1
       - iterate rows (max 2000), apply TrialId filter
-   c. CallAiAsync():
+   c. ParseAndApplyFiltersAsync() — smart NL filter (THREE-LAYER STACK):
+      ① NaturalLanguageFilter.Apply() — fast regex path (no LLM call)
+         handles: ranges, comparisons, equality, inequality, contains, "only X",
+         bare-value implicit equality (e.g. "TrialID TRIAL-001")
+      ② AI filter parser — LLM extracts structured JSON conditions when regex finds nothing
+         sends: column headers + user prompt → LLM (max 400 tokens, temperature=0)
+         LLM returns: {"filters":[{"col":"TrialID","op":"eq","val":"TRIAL-001"}]}
+         ApplyAiFilters() converts conditions to predicates and applies them
+      ③ No filter — returns all rows if both ① and ② yield nothing
+      Filter note appended to document appendix (e.g. "TrialID = 'TRIAL-001' — 25 rows shown.")
+   d. GenerateCharts() from filtered data
+   e. CallAiAsync():
       - BuildSystemPrompt() — JSON schema instruction, clinical analyst persona
       - BuildUserPrompt()   — templateType, filters, headers, up to 100 rows as CSV
       - IChatCompletionService.GetChatMessageContentAsync() via Groq or Azure OpenAI
       - ExtractJson() → deserialize to AiReportContent
-   d. BuildDocument(aiContent, data, format):
+   f. BuildDocument(aiContent, data, format):
       Word  → OpenXML: title, executive summary, key findings bullets,
                analysis sections, data appendix table (max 500 rows)
       PDF   → QuestPDF: same content, paginated, A4 landscape for data table (max 1000 rows)
       Excel → ClosedXML: "AI Analysis" sheet (all text sections) +
                           "Patient Data" sheet (full data table with formatting)
-   e. UploadAsync("generated-docs", "{jobId}.{ext}")
-   f. returns { jobId, downloadUrl: "http://localhost:7001/api/reports/{jobId}/download?format={ext}", isAsync: false }
+   g. UploadAsync("generated-docs", "{jobId}.{ext}")
+   h. returns { jobId, downloadUrl: "http://localhost:7001/api/reports/{jobId}/download?format={ext}", isAsync: false }
 
 4. User downloads      → GET /api/reports/{jobId}/download?format={ext}
                        → DownloadAsync("generated-docs", "{jobId}.{ext}")
                        → File(stream, mimeType, "report-{jobId}.{ext}")
 
 Fallback (no AI key set):
-   LocalReportOrchestrator — identical flow but skips step (c);
-   writes raw Excel rows directly into the document with no AI analysis.
+   LocalReportOrchestrator — identical flow but skips steps (d)+(e);
+   uses NaturalLanguageFilter (regex only, no AI filter fallback) then writes
+   raw Excel rows directly into the document with no AI analysis.
 ```
 
 ---
@@ -332,6 +351,64 @@ GPT-4o / Groq returns a JSON object matching this record:
 | `statisticalInsights` | string | Ranges, distributions, key trends |
 | `recommendations` | string | Clinical and operational recommendations |
 | `limitations` | string | Data gaps, truncation, missing columns, caveats |
+
+---
+
+## Natural-Language Row Filtering
+
+The free-text prompt field supports structured filter conditions parsed in two stages.
+
+### Stage 1 — Regex fast-path (`NaturalLanguageFilter.cs`)
+No LLM call. Handles all common patterns immediately:
+
+| Pattern | Example | Operator |
+|---|---|---|
+| Range (and/to) | `age between 30 and 40` · `age between 30 to 40` | `>=` AND `<=` |
+| Range (from/to) | `age from 30 to 40` | `>=` AND `<=` |
+| Range shorthand | `age 30-40` | `>=` AND `<=` |
+| Less than | `age less than 40` · `age < 40` · `age under 40` · `age younger than 40` | `<` |
+| Less than or equal | `age at most 40` · `age <= 40` · `age maximum 40` · `age no more than 40` | `<=` |
+| Greater than | `score greater than 80` · `score > 80` · `score over 80` · `score older than 60` | `>` |
+| Greater than or equal | `dosage at least 75` · `dosage >= 75` · `dosage minimum 75` · `dosage no less than 75` | `>=` |
+| Numeric equality | `dosage equal to 75` | `==` |
+| Text equality | `gender is Female` · `outcome = Completed` · `result equals Improved` | exact match |
+| Text inequality | `outcome is not Completed` · `result != Improved` · `excluding Placebo` | != |
+| Contains | `treatment contains A` · `group includes Placebo` | substring |
+| Only (cross-column) | `only Treatment-A` · `show only TRIAL-002` | any cell exact match |
+| Bare value (implicit eq) | `TrialID TRIAL-001` (no operator keyword) | exact match |
+
+Multiple conditions in a single prompt are ANDed together:
+`age between 30 and 40 and gender is Female` → both predicates applied.
+
+### Stage 2 — AI filter parsing (`SemanticKernelOrchestrator.ParseAndApplyFiltersAsync`)
+Only triggered when Stage 1 finds zero predicates. Sends a tiny prompt to the LLM:
+```
+Available columns: PatientID, SubjectID, TrialID, ...
+User filter prompt: "filter only TrialID TRIAL-001"
+```
+LLM returns structured JSON (max 400 tokens, temperature=0):
+```json
+{"filters":[{"col":"TrialID","op":"eq","val":"TRIAL-001"}]}
+```
+`ApplyAiFilters()` resolves column names (fuzzy match), builds predicates, applies them.
+Falls back to returning all rows if the AI call fails.
+
+### AiFilterCondition schema
+```csharp
+record AiFilterCondition {
+    string  Col;   // column name (case-insensitive fuzzy match against headers)
+    string  Op;    // eq | neq | lt | lte | gt | gte | between | contains
+    string? Val;   // text value for eq / neq / contains
+    double  Num;   // numeric value for lt / lte / gt / gte
+    double  Low;   // lower bound for between
+    double  High;  // upper bound for between
+}
+```
+
+### Filter note in generated documents
+When a filter is applied, a note is injected at the top of the appendix in every format:
+- Word / PDF: amber text — `Filter applied: TrialID = 'TRIAL-001' — 25 row(s) shown.`
+- Excel: merged cell in "Patient Data" sheet above the header row
 
 ---
 
@@ -512,3 +589,5 @@ npx playwright test
 - Never register `StubBlobStorageService` or the orchestrator as `Scoped` — always `Singleton`.
 - Never use `AzureOpenAIPromptExecutionSettings` in `SemanticKernelOrchestrator` — use `OpenAIPromptExecutionSettings` so both Groq and Azure OpenAI work without code changes.
 - Never send more than 100 rows to the LLM in a single prompt.
+- Never send data rows to the LLM for filtering — only send column headers + prompt; apply predicates in C#.
+- Never group `<=` with `<` or `>=` with `>` in the filter switch — they are distinct operators (`<=` is `≤`, not `<`).
