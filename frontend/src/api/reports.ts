@@ -1,6 +1,9 @@
 import type { AxiosError } from 'axios'
 import apiClient from './apiClient'
 import type {
+  CustomTemplateDetail,
+  CustomTemplateRequest,
+  CustomTemplateSummary,
   DashboardStats,
   DuplicateUploadResponse,
   JobStatusResult,
@@ -24,13 +27,24 @@ export async function getTemplates(): Promise<TemplateInfo[]> {
  * `{ kind: 'duplicate' }` when the same file (by SHA-256) already exists.
  * Pass `force = true` to bypass the duplicate check and upload anyway.
  */
-export async function uploadFile(file: File, force = false): Promise<UploadResponse> {
+export async function uploadFile(
+  file: File,
+  force = false,
+  onProgress?: (pct: number) => void,
+): Promise<UploadResponse> {
   const form = new FormData()
   form.append('file', file)
   try {
     const { data } = await apiClient.post<UploadResult>(
       `/api/uploads${force ? '?force=true' : ''}`,
       form,
+      {
+        onUploadProgress: (evt) => {
+          if (onProgress && evt.total) {
+            onProgress(Math.round((evt.loaded * 100) / evt.total))
+          }
+        },
+      },
     )
     return { kind: 'success', blobName: data.blobName }
   } catch (err) {
@@ -69,6 +83,32 @@ export async function getReportsHistory(page = 1, pageSize = 20): Promise<Report
 export async function getDashboard(): Promise<DashboardStats> {
   const { data } = await apiClient.get<DashboardStats>('/api/dashboard')
   return data
+}
+
+// ── Custom report template API ────────────────────────────────────────────────
+
+export async function getCustomTemplates(): Promise<CustomTemplateSummary[]> {
+  const { data } = await apiClient.get<CustomTemplateSummary[]>('/api/report-templates')
+  return data
+}
+
+export async function getCustomTemplate(id: string): Promise<CustomTemplateDetail> {
+  const { data } = await apiClient.get<CustomTemplateDetail>(`/api/report-templates/${id}`)
+  return data
+}
+
+export async function createCustomTemplate(req: CustomTemplateRequest): Promise<CustomTemplateDetail> {
+  const { data } = await apiClient.post<CustomTemplateDetail>('/api/report-templates', req)
+  return data
+}
+
+export async function updateCustomTemplate(id: string, req: CustomTemplateRequest): Promise<CustomTemplateDetail> {
+  const { data } = await apiClient.put<CustomTemplateDetail>(`/api/report-templates/${id}`, req)
+  return data
+}
+
+export async function deleteCustomTemplate(id: string): Promise<void> {
+  await apiClient.delete(`/api/report-templates/${id}`)
 }
 
 export function getApiErrorMessage(err: unknown): string {

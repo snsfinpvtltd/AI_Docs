@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using ClinicalAgent.Api.Data;
 using ClinicalAgent.Api.Infrastructure;
 using Microsoft.AspNetCore.Authorization;
@@ -111,7 +112,12 @@ public class ReportsController : ControllerBase
             return Problem($"Report '{jobId}' not found or has expired.", statusCode: 404);
         }
 
-        return File(result.Value, mime, $"report-{jobId}.{ext}");
+        var job      = await _db.ReportJobs.AsNoTracking().FirstOrDefaultAsync(j => j.Id == jobId, cancellationToken);
+        var fileName = job?.ReportName is not null
+            ? Regex.Replace(job.ReportName, @"[^a-zA-Z0-9]+", "-").Trim('-') + $".{ext}"
+            : $"clinical-report-{jobId}.{ext}";
+
+        return File(result.Value, mime, fileName);
     }
 
     /// <summary>Returns report job history for the authenticated user, newest first.</summary>
@@ -135,7 +141,7 @@ public class ReportsController : ControllerBase
 
         var result = records.Select(j => new ReportJobSummary(
             j.Id, j.TemplateType, j.OutputFormat, j.Status,
-            j.CreatedAt, j.CompletedAt, j.DownloadUrl, j.RowCount, j.PromptText)).ToList();
+            j.CreatedAt, j.CompletedAt, j.DownloadUrl, j.RowCount, j.PromptText, j.ReportName)).ToList();
 
         return Ok(result);
     }

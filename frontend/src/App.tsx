@@ -1,15 +1,17 @@
 import { type ReactElement } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { useAuth } from './auth/AuthContext'
-import LoginPage           from './pages/LoginPage'
-import AuthCallbackPage    from './pages/AuthCallbackPage'
-import DashboardPage       from './pages/DashboardPage'
-import ReportRequestPage   from './pages/ReportRequestPage'
-import UploadDataPage      from './pages/UploadDataPage'
-import StatusPage          from './pages/StatusPage'
-import DownloadPage        from './pages/DownloadPage'
-import UploadsHistoryPage  from './pages/UploadsHistoryPage'
-import ReportsHistoryPage  from './pages/ReportsHistoryPage'
+import LoginPage                  from './pages/LoginPage'
+import AuthCallbackPage           from './pages/AuthCallbackPage'
+import DashboardPage              from './pages/DashboardPage'
+import ReportRequestPage          from './pages/ReportRequestPage'
+import UploadDataPage             from './pages/UploadDataPage'
+import StatusPage                 from './pages/StatusPage'
+import DownloadPage               from './pages/DownloadPage'
+import UploadsHistoryPage         from './pages/UploadsHistoryPage'
+import ReportsHistoryPage         from './pages/ReportsHistoryPage'
+import ReportTemplatesPage        from './pages/ReportTemplatesPage'
+import ReportTemplateBuilderPage  from './pages/ReportTemplateBuilderPage'
 
 function ProtectedRoute({ children }: { children: ReactElement }): ReactElement {
   const { isAuthenticated, isLoading } = useAuth()
@@ -46,8 +48,11 @@ export default function App(): ReactElement {
         <Route path="/request"   element={<ProtectedRoute><ReportRequestPage /></ProtectedRoute>} />
         <Route path="/uploads"   element={<ProtectedRoute><UploadsHistoryPage /></ProtectedRoute>} />
         <Route path="/reports"   element={<ProtectedRoute><ReportsHistoryPage /></ProtectedRoute>} />
-        <Route path="/status/:jobId"   element={<ProtectedRoute><StatusPage /></ProtectedRoute>} />
-        <Route path="/download/:jobId" element={<ProtectedRoute><DownloadPage /></ProtectedRoute>} />
+        <Route path="/status/:jobId"        element={<ProtectedRoute><StatusPage /></ProtectedRoute>} />
+        <Route path="/download/:jobId"      element={<ProtectedRoute><DownloadPage /></ProtectedRoute>} />
+        <Route path="/templates"            element={<ProtectedRoute><ReportTemplatesPage /></ProtectedRoute>} />
+        <Route path="/templates/new"        element={<ProtectedRoute><ReportTemplateBuilderPage /></ProtectedRoute>} />
+        <Route path="/templates/:id/edit"   element={<ProtectedRoute><ReportTemplateBuilderPage /></ProtectedRoute>} />
 
         {/* Fallback */}
         <Route path="*" element={<Navigate to="/dashboard" replace />} />

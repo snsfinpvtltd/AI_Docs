@@ -34,9 +34,28 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
     private readonly ILogger<SemanticKernelOrchestrator> _logger;
     private readonly ConcurrentDictionary<string, JobStatusResult> _jobs = new();
 
-    private const int MaxRowsToAi    = 100;   // rows sent to GPT-4o (token budget)
+    // Caches the LLM-parsed filter conditions so repeated requests with the same
+    // prompt + column layout skip the extra Groq API call entirely.
+    private readonly ConcurrentDictionary<string, AiFilterResult?> _aiFilterCache = new(StringComparer.OrdinalIgnoreCase);
+
+    private const int MaxRowsToAi    = 30;    // rows sent to LLM — kept low for Groq 12k TPM free tier
     private const int MaxDocRows      = 500;   // rows in Word appendix table
     private const int MaxPdfRows      = 1000;  // rows in PDF data table
+
+    // Default section order used when no custom template is selected.
+    private static readonly IReadOnlyList<ClinicalAgent.Api.Data.TemplateSection> DefaultSections =
+    [
+        new() { Id="d1",  Type="ExecutiveSummary",    Heading="Executive Summary",    IsEnabled=true, Order=0  },
+        new() { Id="d2",  Type="KeyFindings",          Heading="Key Findings",         IsEnabled=true, Order=1  },
+        new() { Id="d3",  Type="Charts",               Heading="Data Visualisations",  IsEnabled=true, Order=2  },
+        new() { Id="d4",  Type="DataOverview",         Heading="Data Overview",        IsEnabled=true, Order=3  },
+        new() { Id="d5",  Type="PatientAnalysis",      Heading="Patient Analysis",     IsEnabled=true, Order=4  },
+        new() { Id="d6",  Type="AdverseEvents",        Heading="Adverse Events",       IsEnabled=true, Order=5  },
+        new() { Id="d7",  Type="StatisticalInsights",  Heading="Statistical Insights", IsEnabled=true, Order=6  },
+        new() { Id="d8",  Type="Recommendations",      Heading="Recommendations",      IsEnabled=true, Order=7  },
+        new() { Id="d9",  Type="Limitations",          Heading="Limitations",          IsEnabled=true, Order=8  },
+        new() { Id="d10", Type="DataTable",            Heading="Appendix — Raw Data",  IsEnabled=true, Order=9  },
+    ];
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -63,76 +82,31 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
 
     // ── IReportOrchestrator ───────────────────────────────────────────────────
 
-    /// <summary>Downloads Excel, sends data to GPT-4o, generates an AI-authored document.</summary>
+    /// <summary>
+    /// Queues an AI report job, persists a Processing record immediately, and returns
+    /// as soon as the background task is fired. Progress is tracked via GetStatusAsync.
+    /// </summary>
     public async Task<Result<ReportSubmitResult>> SubmitAsync(
         ReportRequest request,
         string userId,
         CancellationToken ct = default)
     {
-        var jobId = Guid.NewGuid().ToString("N")[..12];
-        var ext   = request.OutputFormat switch
+        var jobId      = Guid.NewGuid().ToString("N")[..12];
+        var ext        = request.OutputFormat switch
         {
             OutputFormat.Excel => "xlsx",
             OutputFormat.Pdf   => "pdf",
             _                  => "docx"
         };
         var downloadUrl = $"http://localhost:7001/api/reports/{jobId}/download?format={ext}";
+        var reportName  = BuildReportName(request);
 
-        // 1. Download and merge data from all blobs
-        ParsedData data;
-        try { data = await DownloadAndMergeAsync(request, ct); }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to load data for user {UserId} ({Count} blob(s))",
-                userId, request.BlobNames.Count);
-            return Result<ReportSubmitResult>.Fail($"Could not load data files: {ex.Message}");
-        }
+        // Register immediately so the first status poll succeeds.
+        _jobs[jobId] = new JobStatusResult(jobId, ReportStatus.Processing, null, 5, null, "Preparing…");
 
-        // 3. Apply smart filter: AI-assisted parsing → regex fallback
-        var (filteredRows, filterNote) = await ParseAndApplyFiltersAsync(
-            request.FreeTextPrompt, data.Headers, data.Rows, jobId, ct);
-        if (filterNote is not null)
-        {
-            _logger.LogInformation("Filter applied for job {JobId}: {Filter} → {Count}/{Total} rows",
-                jobId, filterNote, filteredRows.Count, data.Rows.Count);
-            data = data with { Rows = filteredRows };
-        }
-
-        // 4. Generate charts from the filtered data
-        var charts = ChartGenerator.GenerateCharts(data.Headers, data.Rows);
-        _logger.LogInformation("Generated {Count} chart(s) for job {JobId}", charts.Count, jobId);
-
-        // 5. Call GPT-4o
-        AiReportContent aiContent;
-        try { aiContent = await CallAiAsync(data, request, ct); }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "AI analysis failed for job {JobId}", jobId);
-            return Result<ReportSubmitResult>.Fail($"AI report generation failed: {ex.Message}");
-        }
-
-        // 6. Build document with AI content + charts
-        byte[] bytes;
-        string contentType;
-        try { (bytes, contentType) = BuildDocument(aiContent, data, request.OutputFormat, filterNote, charts); }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Document build failed for job {JobId}", jobId);
-            return Result<ReportSubmitResult>.Fail($"Document generation failed: {ex.Message}");
-        }
-
-        // 5. Store generated document
-        using var docStream = new MemoryStream(bytes);
-        await _storage.UploadAsync(docStream, BlobContainerNames.Generated, $"{jobId}.{ext}", contentType, ct);
-
-        _logger.LogInformation(
-            "AI report {JobId} ({Format}, {Rows} rows) generated for user {UserId}",
-            jobId, ext, data.Rows.Count, userId);
-
-        // Persist job record to SQLite.
+        // Persist a Processing record so history shows the job while it runs.
         await using (var db = await _dbFactory.CreateDbContextAsync(ct))
         {
-            // For a single-file report link the FK; for multi-file leave it null.
             var singleBlob = request.BlobNames.Count == 1 ? request.BlobNames[0] : null;
             var uploadId   = singleBlob is not null
                 ? await db.Uploads.Where(u => u.BlobName == singleBlob).Select(u => u.Id).FirstOrDefaultAsync(ct)
@@ -145,28 +119,230 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
                 BlobName     = singleBlob,
                 TemplateType = request.TemplateType,
                 OutputFormat = ext,
-                Status       = "Completed",
+                Status       = "Processing",
                 CreatedAt    = DateTime.UtcNow,
-                CompletedAt  = DateTime.UtcNow,
-                DownloadUrl  = downloadUrl,
+                CompletedAt  = null,
+                DownloadUrl  = null,
                 UserId       = userId,
                 PromptText   = request.FreeTextPrompt,
-                RowCount     = data.Rows.Count,
+                RowCount     = 0,
+                ReportName   = reportName,
             });
             await db.SaveChangesAsync(ct);
         }
 
-        var status = new JobStatusResult(jobId, ReportStatus.Completed, downloadUrl, 100, null);
-        _jobs[jobId] = status;
-        return Result<ReportSubmitResult>.Ok(new ReportSubmitResult(jobId, downloadUrl, IsAsync: false));
+        // Fire background task — intentionally not awaited.
+        _ = Task.Run(() => RunJobAsync(jobId, ext, downloadUrl, reportName, request, userId));
+
+        _logger.LogInformation("AI report job {JobId} queued for user {UserId}", jobId, userId);
+        return Result<ReportSubmitResult>.Ok(new ReportSubmitResult(jobId, null, IsAsync: true));
     }
 
-    /// <summary>Returns the current job status.</summary>
-    public Task<Result<JobStatusResult>> GetStatusAsync(string jobId, CancellationToken ct = default)
+    /// <summary>Returns the current job status, with DB fallback for page-refresh resilience.</summary>
+    public async Task<Result<JobStatusResult>> GetStatusAsync(string jobId, CancellationToken ct = default)
     {
-        if (_jobs.TryGetValue(jobId, out var status))
-            return Task.FromResult(Result<JobStatusResult>.Ok(status));
-        return Task.FromResult(Result<JobStatusResult>.Fail($"Job '{jobId}' not found."));
+        if (_jobs.TryGetValue(jobId, out var cached))
+            return Result<JobStatusResult>.Ok(cached);
+
+        // DB fallback: survives page refreshes and server restarts.
+        await using var db = await _dbFactory.CreateDbContextAsync(ct);
+        var job = await db.ReportJobs.AsNoTracking()
+            .FirstOrDefaultAsync(j => j.Id == jobId, ct);
+
+        if (job is null)
+            return Result<JobStatusResult>.Fail($"Job '{jobId}' not found.");
+
+        var rs = job.Status switch
+        {
+            "Completed"  => ReportStatus.Completed,
+            "Failed"     => ReportStatus.Failed,
+            "Processing" => ReportStatus.Processing,
+            _            => ReportStatus.Queued,
+        };
+        return Result<JobStatusResult>.Ok(new JobStatusResult(
+            jobId, rs, job.DownloadUrl,
+            rs == ReportStatus.Completed ? 100 : null,
+            rs == ReportStatus.Failed ? "Generation failed — please try again." : null,
+            rs == ReportStatus.Completed ? "Report ready" : rs.ToString()));
+    }
+
+    // ── Background job ────────────────────────────────────────────────────────
+
+    private async Task RunJobAsync(
+        string jobId,
+        string ext,
+        string downloadUrl,
+        string reportName,
+        ReportRequest request,
+        string userId)
+    {
+        try
+        {
+            // Stage 1 — load & merge Excel data (10 %)
+            SetProgress(jobId, 10, "Loading data files");
+            ParsedData data;
+            try
+            {
+                data = await DownloadAndMergeAsync(request, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to load data for job {JobId}", jobId);
+                await FinishJobAsync(jobId, "Failed", 0, null, $"Could not load data: {ex.Message}");
+                return;
+            }
+
+            // Stage 2 — apply smart filter (25 %)
+            SetProgress(jobId, 25, "Applying filters");
+            var (filteredRows, filterNote) = await ParseAndApplyFiltersAsync(
+                request.FreeTextPrompt, data.Headers, data.Rows, jobId, CancellationToken.None);
+            if (filterNote is not null)
+            {
+                _logger.LogInformation("Filter applied for job {JobId}: {Filter} → {Count}/{Total} rows",
+                    jobId, filterNote, filteredRows.Count, data.Rows.Count);
+                data = data with { Rows = filteredRows };
+            }
+
+            // Stage 3 — load custom template (35 %)
+            SetProgress(jobId, 35, "Loading template");
+            IReadOnlyList<ClinicalAgent.Api.Data.TemplateSection>? customSections = null;
+            if (!string.IsNullOrWhiteSpace(request.CustomTemplateId))
+            {
+                await using var tplDb = await _dbFactory.CreateDbContextAsync(CancellationToken.None);
+                var tpl = await tplDb.ReportTemplates.FindAsync([request.CustomTemplateId], CancellationToken.None);
+                if (tpl is not null)
+                {
+                    var parsed = JsonSerializer.Deserialize<ClinicalAgent.Api.Data.TemplateSection[]>(
+                        tpl.SectionsJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? [];
+                    customSections = parsed.Where(s => s.IsEnabled).OrderBy(s => s.Order).ToArray();
+                    _logger.LogInformation("Custom template '{Name}' ({Count} sections) applied to job {JobId}",
+                        tpl.Name, customSections.Count, jobId);
+                }
+            }
+
+            // Stage 4 — charts + AI in parallel (40 → 65 %)
+            // Charts are CPU-bound and fast; AI is the network bottleneck.
+            // Starting both concurrently means charts are ready when AI returns.
+            // A separate ticker task increments the progress bar while Groq is thinking
+            // so the UI never stalls at a fixed percentage.
+            SetProgress(jobId, 40, "Generating charts & running AI analysis");
+            var chartsTask = Task.Run(() => ChartGenerator.GenerateCharts(data.Headers, data.Rows));
+            var aiTask     = CallAiAsync(data, request, customSections, CancellationToken.None);
+
+            using var tickCts = new CancellationTokenSource();
+            var tickTask = Task.Run(async () =>
+            {
+                int pct = 42;
+                while (!tickCts.Token.IsCancellationRequested && pct < 63)
+                {
+                    try { await Task.Delay(2500, tickCts.Token); } catch { break; }
+                    pct = Math.Min(pct + 3, 63);
+                    SetProgress(jobId, pct, "Analysing patient data with AI…");
+                }
+            }, tickCts.Token);
+
+            AiReportContent aiContent;
+            try
+            {
+                aiContent = await aiTask;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "AI analysis failed for job {JobId}", jobId);
+                await FinishJobAsync(jobId, "Failed", data.Rows.Count, null,
+                    $"AI report generation failed: {ex.Message}");
+                return;
+            }
+            finally
+            {
+                await tickCts.CancelAsync();
+            }
+
+            var charts = await chartsTask; // almost certainly done while AI was running
+            _logger.LogInformation("Generated {Count} chart(s) for job {JobId}", charts.Count, jobId);
+            SetProgress(jobId, 65, "AI analysis complete");
+
+            // Stage 5 — build output document (80 %)
+            SetProgress(jobId, 80, "Building document");
+            byte[] bytes;
+            string contentType;
+            try
+            {
+                (bytes, contentType) = BuildDocument(aiContent, data, request.OutputFormat,
+                    filterNote, charts, customSections);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Document build failed for job {JobId}", jobId);
+                await FinishJobAsync(jobId, "Failed", data.Rows.Count, null,
+                    $"Document generation failed: {ex.Message}");
+                return;
+            }
+
+            // Stage 6 — upload to blob storage (95 %)
+            SetProgress(jobId, 95, "Uploading document");
+            using var docStream = new MemoryStream(bytes);
+            await _storage.UploadAsync(docStream, BlobContainerNames.Generated,
+                $"{jobId}.{ext}", contentType, CancellationToken.None);
+
+            _logger.LogInformation("AI report {JobId} ({Format}, {Rows} rows) complete for user {UserId}",
+                jobId, ext, data.Rows.Count, userId);
+            await FinishJobAsync(jobId, "Completed", data.Rows.Count, downloadUrl, null);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unexpected error in background job {JobId}", jobId);
+            await FinishJobAsync(jobId, "Failed", 0, null, $"Unexpected error: {ex.Message}");
+        }
+    }
+
+    private void SetProgress(string jobId, int percent, string stageName)
+        => _jobs[jobId] = new JobStatusResult(jobId, ReportStatus.Processing, null, percent, null, stageName);
+
+    private async Task FinishJobAsync(
+        string jobId, string dbStatus, int rowCount, string? downloadUrl, string? error)
+    {
+        var rs = dbStatus == "Completed" ? ReportStatus.Completed : ReportStatus.Failed;
+        _jobs[jobId] = new JobStatusResult(
+            jobId, rs, downloadUrl,
+            dbStatus == "Completed" ? 100 : null,
+            error,
+            dbStatus == "Completed" ? "Report ready" : "Failed");
+
+        try
+        {
+            await using var db = await _dbFactory.CreateDbContextAsync(CancellationToken.None);
+            var job = await db.ReportJobs.FindAsync([jobId]);
+            if (job is null) return;
+            job.Status      = dbStatus;
+            job.CompletedAt = DateTime.UtcNow;
+            job.DownloadUrl = downloadUrl;
+            job.RowCount    = rowCount;
+            await db.SaveChangesAsync(CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to persist job completion for {JobId}", jobId);
+        }
+    }
+
+    private static string BuildReportName(ReportRequest request)
+    {
+        var template = request.TemplateType switch
+        {
+            "patient-summary" => "Patient Summary",
+            "outcome-data"    => "Outcome Data",
+            "full-report"     => "Full Trial Report",
+            _                 => "Clinical Report",
+        };
+        var trial = string.IsNullOrWhiteSpace(request.TrialId) ? "All Trials" : request.TrialId.Trim();
+        return $"{template} – {trial} – {DateTime.UtcNow:dd MMM yyyy}";
+    }
+
+    internal static string BuildReportFileName(string reportName, string ext)
+    {
+        var slug = Regex.Replace(reportName, @"[^a-zA-Z0-9]+", "-").Trim('-');
+        return $"{slug}.{ext}";
     }
 
     // ── Excel loading & merging ───────────────────────────────────────────────
@@ -200,6 +376,9 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
                     h.Equals("TrialId",    StringComparison.OrdinalIgnoreCase));
             }
 
+            // Pre-allocate one reusable column count so we don't re-query Count per row.
+            int colCount = headers.Count;
+
             foreach (var row in ws.RowsUsed().Skip(1))
             {
                 if (allRows.Count >= 2000) break;
@@ -210,9 +389,11 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
                     if (!v.Equals(request.TrialId, StringComparison.OrdinalIgnoreCase)) continue;
                 }
 
-                allRows.Add(Enumerable.Range(1, headers.Count)
-                    .Select(c => GetCellString(row.Cell(c)))
-                    .ToList());
+                // Pre-allocated string array + for loop avoids per-row LINQ overhead.
+                var rowData = new string[colCount];
+                for (int c = 0; c < colCount; c++)
+                    rowData[c] = GetCellString(row.Cell(c + 1));
+                allRows.Add(rowData);
             }
         }
 
@@ -247,46 +428,59 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
             return (regexRows, regexNote);
 
         // Slow path: ask the LLM to understand the filter intent.
+        // Key on column names + prompt so repeated requests with the same filter skip the LLM call.
+        var cacheKey = $"{string.Join("|", headers)}§{prompt.Trim()}";
         try
         {
-            var chatService = _kernel.GetRequiredService<IChatCompletionService>();
-            var history = new ChatHistory();
+            AiFilterResult? parsed;
+            if (!_aiFilterCache.TryGetValue(cacheKey, out parsed))
+            {
+                var chatService = _kernel.GetRequiredService<IChatCompletionService>();
+                var history = new ChatHistory();
 
-            history.AddSystemMessage("""
-                Extract every filter condition from the user's prompt and return ONLY a JSON object.
-                No markdown fences, no explanation — just the JSON.
+                history.AddSystemMessage("""
+                    Extract every filter condition from the user's prompt and return ONLY a JSON object.
+                    No markdown fences, no explanation — just the JSON.
 
-                Schema:
-                {
-                  "filters": [
-                    { "col": "<exact column name>", "op": "eq",      "val": "<text>" },
-                    { "col": "<exact column name>", "op": "neq",     "val": "<text>" },
-                    { "col": "<exact column name>", "op": "contains","val": "<text>" },
-                    { "col": "<exact column name>", "op": "lt",      "num": 40 },
-                    { "col": "<exact column name>", "op": "lte",     "num": 40 },
-                    { "col": "<exact column name>", "op": "gt",      "num": 50 },
-                    { "col": "<exact column name>", "op": "gte",     "num": 50 },
-                    { "col": "<exact column name>", "op": "between", "low": 30, "high": 40 }
-                  ]
-                }
+                    Schema:
+                    {
+                      "filters": [
+                        { "col": "<exact column name>", "op": "eq",      "val": "<text>" },
+                        { "col": "<exact column name>", "op": "neq",     "val": "<text>" },
+                        { "col": "<exact column name>", "op": "contains","val": "<text>" },
+                        { "col": "<exact column name>", "op": "lt",      "num": 40 },
+                        { "col": "<exact column name>", "op": "lte",     "num": 40 },
+                        { "col": "<exact column name>", "op": "gt",      "num": 50 },
+                        { "col": "<exact column name>", "op": "gte",     "num": 50 },
+                        { "col": "<exact column name>", "op": "between", "low": 30, "high": 40 }
+                      ]
+                    }
 
-                Rules:
-                - "col" must be one of the available column names listed by the user.
-                - Use "eq" for exact text match (case-insensitive).
-                - Use "between" for any range (inclusive).
-                - Multiple conditions = multiple objects in the array; they are ANDed together.
-                - If no filter is expressed, return: {"filters":[]}
-                """);
+                    Rules:
+                    - "col" must be one of the available column names listed by the user.
+                    - Use "eq" for exact text match (case-insensitive).
+                    - Use "between" for any range (inclusive).
+                    - Multiple conditions = multiple objects in the array; they are ANDed together.
+                    - If no filter is expressed, return: {"filters":[]}
+                    """);
 
-            history.AddUserMessage(
-                $"Available columns: {string.Join(", ", headers)}\n\nUser filter prompt: {prompt}");
+                history.AddUserMessage(
+                    $"Available columns: {string.Join(", ", headers)}\n\nUser filter prompt: {prompt}");
 
-            var settings = new OpenAIPromptExecutionSettings { Temperature = 0, MaxTokens = 400 };
-            var response  = await chatService.GetChatMessageContentAsync(
-                history, settings, kernel: _kernel, cancellationToken: ct);
+                var settings = new OpenAIPromptExecutionSettings { Temperature = 0, MaxTokens = 300 };
+                var response  = await chatService.GetChatMessageContentAsync(
+                    history, settings, kernel: _kernel, cancellationToken: ct);
 
-            var json   = ExtractJson(response.Content ?? "{}");
-            var parsed = JsonSerializer.Deserialize<AiFilterResult>(json, JsonOpts);
+                parsed = JsonSerializer.Deserialize<AiFilterResult>(
+                    ExtractJson(response.Content ?? "{}"), JsonOpts);
+
+                _aiFilterCache[cacheKey] = parsed;
+                _logger.LogInformation("AI filter conditions parsed and cached for job {JobId}", jobId);
+            }
+            else
+            {
+                _logger.LogInformation("AI filter cache hit for job {JobId}", jobId);
+            }
 
             if (parsed?.Filters is { Length: > 0 })
             {
@@ -294,7 +488,7 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
                 if (result.FilterNote is not null)
                 {
                     _logger.LogInformation(
-                        "AI filter parsed for job {JobId}: {Filter}", jobId, result.FilterNote);
+                        "AI filter applied for job {JobId}: {Filter}", jobId, result.FilterNote);
                     return result;
                 }
             }
@@ -408,18 +602,19 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
     private async Task<AiReportContent> CallAiAsync(
         ParsedData data,
         ReportRequest request,
+        IReadOnlyList<ClinicalAgent.Api.Data.TemplateSection>? customSections,
         CancellationToken ct)
     {
         var chatService = _kernel.GetRequiredService<IChatCompletionService>();
 
         var history = new ChatHistory();
         history.AddSystemMessage(BuildSystemPrompt());
-        history.AddUserMessage(BuildUserPrompt(data, request));
+        history.AddUserMessage(BuildUserPrompt(data, request, customSections));
 
         var settings = new OpenAIPromptExecutionSettings
         {
             Temperature = 0.2,
-            MaxTokens   = 3000,
+            MaxTokens   = 2000,  // keeps total request under Groq free-tier 12k TPM limit
         };
 
         _logger.LogInformation(
@@ -461,7 +656,10 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
         - If a field is not applicable, write a short explanatory sentence; never leave it blank.
         """;
 
-    private static string BuildUserPrompt(ParsedData data, ReportRequest request)
+    private static string BuildUserPrompt(
+        ParsedData data,
+        ReportRequest request,
+        IReadOnlyList<ClinicalAgent.Api.Data.TemplateSection>? customSections = null)
     {
         var sb = new StringBuilder();
 
@@ -470,6 +668,24 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
         sb.AppendLine($"DATE RANGE    : {FormatDateRange(request.DateRangeFrom, request.DateRangeTo)}");
         if (!string.IsNullOrWhiteSpace(data.UserPrompt))
             sb.AppendLine($"USER FOCUS    : {data.UserPrompt}");
+
+        // Per-section AI instructions from the custom template.
+        if (customSections is { Count: > 0 })
+        {
+            var withInstructions = customSections
+                .Where(s => s.IsEnabled
+                         && !string.IsNullOrWhiteSpace(s.AiInstruction)
+                         && s.Type != "DataTable"
+                         && s.Type != "Charts")
+                .ToList();
+            if (withInstructions.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("CUSTOM SECTION FOCUS (apply these specific instructions to each section):");
+                foreach (var sec in withInstructions)
+                    sb.AppendLine($"  {sec.Heading}: {sec.AiInstruction}");
+            }
+        }
 
         sb.AppendLine();
         sb.AppendLine($"COLUMNS ({data.Headers.Count}): {string.Join(" | ", data.Headers)}");
@@ -483,6 +699,19 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
 
         return sb.ToString();
     }
+
+    /// <summary>Maps a section type key to the corresponding AI-generated content field.</summary>
+    private static string? GetAiContent(AiReportContent ai, string sectionType) => sectionType switch
+    {
+        "ExecutiveSummary"    => ai.ExecutiveSummary,
+        "DataOverview"        => ai.DataOverview,
+        "PatientAnalysis"     => ai.PatientAnalysis,
+        "AdverseEvents"       => ai.AdverseEventsAnalysis,
+        "StatisticalInsights" => ai.StatisticalInsights,
+        "Recommendations"     => ai.Recommendations,
+        "Limitations"         => ai.Limitations,
+        _                     => null,
+    };
 
     private static string FormatDateRange(DateOnly? from, DateOnly? to)
     {
@@ -525,19 +754,24 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
 
     private static (byte[] bytes, string contentType) BuildDocument(
         AiReportContent ai, ParsedData data, OutputFormat format, string? filterNote,
-        IReadOnlyList<ChartSpec> charts)
+        IReadOnlyList<ChartSpec> charts,
+        IReadOnlyList<ClinicalAgent.Api.Data.TemplateSection>? customSections = null)
         => format switch
         {
-            OutputFormat.Excel => (BuildExcel(ai, data, filterNote, charts), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-            OutputFormat.Pdf   => (BuildPdf(ai, data, filterNote, charts),   "application/pdf"),
-            _                  => (BuildWord(ai, data, filterNote, charts),   "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+            OutputFormat.Excel => (BuildExcel(ai, data, filterNote, charts, customSections), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            OutputFormat.Pdf   => (BuildPdf(ai, data, filterNote, charts, customSections),   "application/pdf"),
+            _                  => (BuildWord(ai, data, filterNote, charts, customSections),   "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
         };
 
     // ── Word (AI-authored) ────────────────────────────────────────────────────
 
     private static byte[] BuildWord(AiReportContent ai, ParsedData data, string? filterNote,
-        IReadOnlyList<ChartSpec> charts)
+        IReadOnlyList<ChartSpec> charts,
+        IReadOnlyList<ClinicalAgent.Api.Data.TemplateSection>? customSections)
     {
+        var sections = (customSections ?? DefaultSections)
+            .Where(s => s.IsEnabled).OrderBy(s => s.Order).ToList();
+
         using var ms = new MemoryStream();
         using (var doc = WordprocessingDocument.Create(ms, WordprocessingDocumentType.Document))
         {
@@ -545,63 +779,66 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
             main.Document = new OxDocument(new Body());
             var body = main.Document.Body!;
 
-            // Cover
+            // Cover block
             body.Append(WordPara(ai.ReportTitle, bold: true, size: 36));
             body.Append(WordPara(
                 $"Generated by Clinical Trial AI Agent  |  {DateTime.UtcNow:yyyy-MM-dd HH:mm} UTC  |  {data.Rows.Count} patient records",
                 size: 18, color: "555555"));
             body.Append(new Paragraph());
 
-            // Sections
-            void Section(string heading, string body_text)
+            uint imgId = 1U;
+
+            foreach (var sec in sections)
             {
-                body.Append(WordPara(heading, bold: true, size: 26, color: "1e3a8a"));
-                body.Append(WordPara(body_text, size: 20));
-                body.Append(new Paragraph());
-            }
+                var heading = sec.Heading.ToUpperInvariant();
 
-            body.Append(WordPara("EXECUTIVE SUMMARY", bold: true, size: 26, color: "1e3a8a"));
-            body.Append(WordPara(ai.ExecutiveSummary, size: 20));
-            body.Append(new Paragraph());
-
-            // Key findings as bullets
-            body.Append(WordPara("KEY FINDINGS", bold: true, size: 26, color: "1e3a8a"));
-            foreach (var f in ai.KeyFindings)
-                body.Append(WordBullet(f));
-            body.Append(new Paragraph());
-
-            // ── Charts ────────────────────────────────────────────────────────
-            if (charts.Count > 0)
-            {
-                body.Append(WordPara("DATA VISUALISATIONS", bold: true, size: 26, color: "1e3a8a"));
-                body.Append(WordPara(
-                    "The following charts are derived directly from the patient dataset.",
-                    size: 18, color: "555555"));
-                body.Append(new Paragraph());
-                uint imgId = 1U;
-                foreach (var chart in charts)
+                switch (sec.Type)
                 {
-                    body.Append(WordPara(chart.Title, size: 20, color: "333333"));
-                    ChartGenerator.AddToWordDocument(main, body, chart.PngBytes, chart.Title, imgId++);
-                    body.Append(new Paragraph());
+                    case "KeyFindings":
+                        body.Append(WordPara(heading, bold: true, size: 26, color: "1e3a8a"));
+                        foreach (var f in ai.KeyFindings)
+                            body.Append(WordBullet(f));
+                        body.Append(new Paragraph());
+                        break;
+
+                    case "Charts":
+                        if (charts.Count > 0)
+                        {
+                            body.Append(WordPara(heading, bold: true, size: 26, color: "1e3a8a"));
+                            body.Append(WordPara(
+                                "The following charts are derived directly from the patient dataset.",
+                                size: 18, color: "555555"));
+                            body.Append(new Paragraph());
+                            foreach (var chart in charts)
+                            {
+                                body.Append(WordPara(chart.Title, size: 20, color: "333333"));
+                                ChartGenerator.AddToWordDocument(main, body, chart.PngBytes, chart.Title, imgId++);
+                                body.Append(new Paragraph());
+                            }
+                        }
+                        break;
+
+                    case "DataTable":
+                        body.Append(WordPara(heading, bold: true, size: 26, color: "1e3a8a"));
+                        if (filterNote is not null)
+                            body.Append(WordPara($"Filter applied: {filterNote} — {data.Rows.Count} row(s) shown.", size: 18, color: "b45309"));
+                        if (data.Rows.Count > MaxDocRows)
+                            body.Append(WordPara($"First {MaxDocRows} of {data.Rows.Count} rows shown.", size: 18, color: "888888"));
+                        body.Append(BuildWordTable(data, MaxDocRows));
+                        break;
+
+                    default:
+                        var content = GetAiContent(ai, sec.Type);
+                        if (content is not null)
+                        {
+                            body.Append(WordPara(heading, bold: true, size: 26, color: "1e3a8a"));
+                            body.Append(WordPara(content, size: 20));
+                            body.Append(new Paragraph());
+                        }
+                        break;
                 }
             }
 
-            Section("DATA OVERVIEW",          ai.DataOverview);
-            Section("PATIENT ANALYSIS",       ai.PatientAnalysis);
-            Section("ADVERSE EVENTS",         ai.AdverseEventsAnalysis);
-            Section("STATISTICAL INSIGHTS",   ai.StatisticalInsights);
-            Section("RECOMMENDATIONS",        ai.Recommendations);
-            Section("LIMITATIONS",            ai.Limitations);
-
-            // Appendix: raw data table
-            body.Append(WordPara("APPENDIX — RAW DATA", bold: true, size: 26, color: "1e3a8a"));
-            if (filterNote is not null)
-                body.Append(WordPara($"Filter applied: {filterNote} — {data.Rows.Count} row(s) shown.", size: 18, color: "b45309"));
-            if (data.Rows.Count > MaxDocRows)
-                body.Append(WordPara($"First {MaxDocRows} of {data.Rows.Count} rows shown.", size: 18, color: "888888"));
-
-            body.Append(BuildWordTable(data, MaxDocRows));
             main.Document.Save();
         }
         return ms.ToArray();
@@ -678,8 +915,13 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
     // ── Excel (AI analysis + data) ────────────────────────────────────────────
 
     private static byte[] BuildExcel(AiReportContent ai, ParsedData data, string? filterNote,
-        IReadOnlyList<ChartSpec> charts)
+        IReadOnlyList<ChartSpec> charts,
+        IReadOnlyList<ClinicalAgent.Api.Data.TemplateSection>? customSections)
     {
+        var sections = (customSections ?? DefaultSections)
+            .Where(s => s.IsEnabled && s.Type != "DataTable" && s.Type != "Charts")
+            .OrderBy(s => s.Order).ToList();
+
         using var wb = new XLWorkbook();
 
         // Sheet 1: AI Analysis
@@ -704,10 +946,10 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
             row++; // spacer
         }
 
-        void WriteFindings(ref int row)
+        void WriteFindings(ref int row, string heading)
         {
             var hCell = ws.Cell(row, 1);
-            hCell.Value = "KEY FINDINGS";
+            hCell.Value = heading.ToUpperInvariant();
             hCell.Style.Font.Bold            = true;
             hCell.Style.Font.FontSize        = 13;
             hCell.Style.Fill.BackgroundColor = XLColor.FromHtml("#1e3a8a");
@@ -734,14 +976,17 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
         ws.Range(2, 1, 2, 4).Merge();
 
         int r = 4;
-        WriteSection(ref r, "EXECUTIVE SUMMARY",   ai.ExecutiveSummary);
-        WriteFindings(ref r);
-        WriteSection(ref r, "DATA OVERVIEW",        ai.DataOverview);
-        WriteSection(ref r, "PATIENT ANALYSIS",     ai.PatientAnalysis);
-        WriteSection(ref r, "ADVERSE EVENTS",       ai.AdverseEventsAnalysis);
-        WriteSection(ref r, "STATISTICAL INSIGHTS", ai.StatisticalInsights);
-        WriteSection(ref r, "RECOMMENDATIONS",      ai.Recommendations);
-        WriteSection(ref r, "LIMITATIONS",          ai.Limitations);
+        foreach (var sec in sections)
+        {
+            if (sec.Type == "KeyFindings")
+                WriteFindings(ref r, sec.Heading);
+            else
+            {
+                var content = GetAiContent(ai, sec.Type);
+                if (content is not null)
+                    WriteSection(ref r, sec.Heading.ToUpperInvariant(), content);
+            }
+        }
 
         ws.Column(1).Width = 120;
 
@@ -814,10 +1059,20 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
     // ── PDF (AI-authored) ─────────────────────────────────────────────────────
 
     private static byte[] BuildPdf(AiReportContent ai, ParsedData data, string? filterNote,
-        IReadOnlyList<ChartSpec> charts)
+        IReadOnlyList<ChartSpec> charts,
+        IReadOnlyList<ClinicalAgent.Api.Data.TemplateSection>? customSections)
     {
+        var sections = (customSections ?? DefaultSections)
+            .Where(s => s.IsEnabled).OrderBy(s => s.Order).ToList();
+
+        var dataTableSection = sections.FirstOrDefault(s => s.Type == "DataTable");
+        var dataTableHeading = dataTableSection?.Heading ?? "Appendix — Raw Patient Data";
+        var showDataTable    = (dataTableSection is null || dataTableSection.IsEnabled) && data.Rows.Count > 0;
+        var colWeights       = showDataTable ? ChartGenerator.CalcColWeights(data.Headers, data.Rows) : [];
+
         return QDocument.Create(container =>
         {
+            // ── Content pages — A4 portrait ───────────────────────────────────
             container.Page(page =>
             {
                 page.Size(PageSizes.A4);
@@ -836,66 +1091,110 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
 
                 page.Content().PaddingTop(12).Column(col =>
                 {
-                    void PdfSection(string heading, string body_text)
+                    void PdfSection(string heading, string bodyText)
                     {
                         col.Item().PaddingTop(10).Text(heading)
                             .FontSize(12).Bold().FontColor(Colors.Blue.Darken3);
-                        col.Item().PaddingTop(4).Text(body_text).FontSize(10);
+                        col.Item().PaddingTop(4).Text(bodyText).FontSize(10);
                     }
 
-                    // Executive summary
-                    PdfSection("Executive Summary", ai.ExecutiveSummary);
-
-                    // Key findings
-                    col.Item().PaddingTop(10).Text("Key Findings")
-                        .FontSize(12).Bold().FontColor(Colors.Blue.Darken3);
-                    foreach (var f in ai.KeyFindings)
-                        col.Item().PaddingLeft(10).Text($"• {f}").FontSize(10);
-
-                    // ── Charts ────────────────────────────────────────────────
-                    if (charts.Count > 0)
+                    foreach (var sec in sections)
                     {
-                        col.Item().PaddingTop(12).Text("Data Visualisations")
-                            .FontSize(12).Bold().FontColor(Colors.Blue.Darken3);
-                        col.Item().PaddingTop(6).Row(row =>
+                        switch (sec.Type)
                         {
-                            foreach (var chart in charts)
-                            {
-                                row.RelativeItem().Column(c =>
+                            case "KeyFindings":
+                                col.Item().PaddingTop(10).Text(sec.Heading)
+                                    .FontSize(12).Bold().FontColor(Colors.Blue.Darken3);
+                                foreach (var f in ai.KeyFindings)
+                                    col.Item().PaddingLeft(10).Text($"• {f}").FontSize(10);
+                                break;
+
+                            case "Charts":
+                                if (charts.Count > 0)
                                 {
-                                    c.Item().Text(chart.Title).FontSize(9).Bold();
-                                    c.Item().PaddingTop(3).Image(chart.PngBytes).FitWidth();
-                                });
-                                row.ConstantItem(10);
-                            }
-                        });
-                        col.Item().PaddingTop(10).LineHorizontal(0.5f).LineColor(Colors.Grey.Lighten2);
+                                    col.Item().PaddingTop(12).Text(sec.Heading)
+                                        .FontSize(12).Bold().FontColor(Colors.Blue.Darken3);
+                                    col.Item().PaddingTop(6).Row(row =>
+                                    {
+                                        for (int i = 0; i < charts.Count; i++)
+                                        {
+                                            var chart = charts[i];
+                                            row.RelativeItem().Column(c =>
+                                            {
+                                                c.Item().Text(chart.Title).FontSize(9).Bold();
+                                                // Fixed height + FitArea avoids min-size conflicts
+                                                c.Item().PaddingTop(3).Height(150)
+                                                    .Image(chart.PngBytes).FitArea();
+                                            });
+                                            if (i < charts.Count - 1)
+                                                row.ConstantItem(10); // spacer between charts only
+                                        }
+                                    });
+                                    col.Item().PaddingTop(10).LineHorizontal(0.5f).LineColor(Colors.Grey.Lighten2);
+                                }
+                                break;
+
+                            case "DataTable":
+                                break; // rendered on separate landscape page below
+
+                            default:
+                                var content = GetAiContent(ai, sec.Type);
+                                if (content is not null) PdfSection(sec.Heading, content);
+                                break;
+                        }
                     }
+                });
 
-                    PdfSection("Data Overview",         ai.DataOverview);
-                    PdfSection("Patient Analysis",      ai.PatientAnalysis);
-                    PdfSection("Adverse Events",        ai.AdverseEventsAnalysis);
-                    PdfSection("Statistical Insights",  ai.StatisticalInsights);
-                    PdfSection("Recommendations",       ai.Recommendations);
-                    PdfSection("Limitations",           ai.Limitations);
-
-                    // Data appendix
-                    col.Item().PaddingTop(20).Text("Appendix — Raw Patient Data")
-                        .FontSize(12).Bold().FontColor(Colors.Blue.Darken3);
-                    if (filterNote is not null)
-                        col.Item().Text($"Filter applied: {filterNote} — {data.Rows.Count} row(s) shown.")
-                            .FontSize(9).Bold().FontColor(Colors.Orange.Darken3);
-                    if (data.Rows.Count > MaxPdfRows)
-                        col.Item().Text($"First {MaxPdfRows} of {data.Rows.Count} rows shown.")
-                            .FontSize(8).FontColor(Colors.Grey.Darken1);
-
-                    var colWeights = ChartGenerator.CalcColWeights(data.Headers, data.Rows);
-                    col.Item().PaddingTop(6).Table(tbl =>
+                page.Footer().Row(r =>
+                {
+                    r.RelativeItem()
+                        .Text($"Clinical Trial Agent POC  |  AI-Generated Report  |  {DateTime.UtcNow:yyyy-MM-dd}")
+                        .FontSize(8).FontColor(Colors.Grey.Darken1);
+                    r.ConstantItem(80).AlignRight().Text(x =>
                     {
+                        x.Span("Page ").FontSize(8);
+                        x.CurrentPageNumber().FontSize(8);
+                        x.Span(" of ").FontSize(8);
+                        x.TotalPages().FontSize(8);
+                    });
+                });
+            });
+
+            // ── Data table pages — A4 landscape (avoids portrait column overflow) ──
+            if (showDataTable)
+            {
+                container.Page(page =>
+                {
+                    page.Size(PageSizes.A4.Landscape());
+                    page.Margin(1.5f, Unit.Centimetre);
+                    page.DefaultTextStyle(x => x.FontSize(8));
+
+                    page.Header().Column(col =>
+                    {
+                        col.Item().Text(dataTableHeading)
+                            .FontSize(14).Bold().FontColor(Colors.Blue.Darken3);
+                        if (filterNote is not null)
+                            col.Item().PaddingTop(2)
+                                .Text($"Filter applied: {filterNote} — {data.Rows.Count} row(s) shown.")
+                                .FontSize(8).Bold().FontColor(Colors.Orange.Darken3);
+                        if (data.Rows.Count > MaxPdfRows)
+                            col.Item().Text($"First {MaxPdfRows} of {data.Rows.Count} rows shown.")
+                                .FontSize(7).FontColor(Colors.Grey.Darken1);
+                        col.Item().PaddingTop(4).LineHorizontal(1).LineColor(Colors.Blue.Darken3);
+                    });
+
+                    page.Content().PaddingTop(8).Table(tbl =>
+                    {
+                        // ConstantColumn gives QuestPDF an exact width per column so it can
+                        // wrap text correctly. RelativeColumn still enforces unbreakable-token
+                        // minimum widths which overflow when there are many columns.
+                        // A4 landscape available ≈ 756.85pt (267mm). Use 750pt budget to stay
+                        // safely under that limit regardless of column count.
+                        var colWidthPt = (float)Math.Floor(750f / Math.Max(1, data.Headers.Count));
                         tbl.ColumnsDefinition(cd =>
                         {
-                            foreach (var w in colWeights)
-                                cd.RelativeColumn(w);
+                            foreach (var _ in data.Headers)
+                                cd.ConstantColumn(colWidthPt);
                         });
 
                         tbl.Header(header =>
@@ -913,26 +1212,26 @@ internal sealed class SemanticKernelOrchestrator : IReportOrchestrator
                             var bg = odd ? Colors.White : Colors.Blue.Lighten5;
                             foreach (var cell in row)
                                 tbl.Cell().Background(bg).Padding(3)
-                                    .Text(ChartGenerator.FormatCell(cell)).FontSize(8);
+                                    .Text(ChartGenerator.FormatCell(cell)).FontSize(7);
                             odd = !odd;
                         }
                     });
-                });
 
-                page.Footer().Row(r =>
-                {
-                    r.RelativeItem()
-                        .Text($"Clinical Trial Agent POC  |  AI-Generated Report  |  {DateTime.UtcNow:yyyy-MM-dd}")
-                        .FontSize(8).FontColor(Colors.Grey.Darken1);
-                    r.ConstantItem(80).AlignRight().Text(x =>
+                    page.Footer().Row(r =>
                     {
-                        x.Span("Page ").FontSize(8);
-                        x.CurrentPageNumber().FontSize(8);
-                        x.Span(" of ").FontSize(8);
-                        x.TotalPages().FontSize(8);
+                        r.RelativeItem()
+                            .Text($"Clinical Trial Agent POC  |  AI-Generated Report  |  {DateTime.UtcNow:yyyy-MM-dd}")
+                            .FontSize(8).FontColor(Colors.Grey.Darken1);
+                        r.ConstantItem(80).AlignRight().Text(x =>
+                        {
+                            x.Span("Page ").FontSize(8);
+                            x.CurrentPageNumber().FontSize(8);
+                            x.Span(" of ").FontSize(8);
+                            x.TotalPages().FontSize(8);
+                        });
                     });
                 });
-            });
+            }
         }).GeneratePdf();
     }
 }

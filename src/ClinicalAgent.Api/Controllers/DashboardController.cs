@@ -49,7 +49,7 @@ public class DashboardController : ControllerBase
             .Take(5)
             .Select(j => new ReportJobSummary(
                 j.Id, j.TemplateType, j.OutputFormat, j.Status,
-                j.CreatedAt, j.CompletedAt, j.DownloadUrl, j.RowCount, j.PromptText))
+                j.CreatedAt, j.CompletedAt, j.DownloadUrl, j.RowCount, j.PromptText, j.ReportName))
             .ToList();
 
         // ── Chart data ─────────────────────────────────────────────────────────
@@ -122,4 +122,5 @@ public record ReportJobSummary(
     DateTime? CompletedAt,
     string? DownloadUrl,
     int RowCount,
-    string? PromptText);
+    string? PromptText,
+    string? ReportName = null);

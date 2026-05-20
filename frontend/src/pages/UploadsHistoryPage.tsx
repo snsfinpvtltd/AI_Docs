@@ -77,7 +77,7 @@ export default function UploadsHistoryPage(): ReactElement {
             </div>
             <p className="text-brand-charcoal font-semibold font-heading mb-1">No uploads yet</p>
             <p className="text-brand-muted text-sm mb-4">Upload an Excel file to get started with report generation.</p>
-            <Link to="/request" className="text-[#1EB5C7] hover:underline text-sm font-medium">
+            <Link to="/upload" className="text-[#1EB5C7] hover:underline text-sm font-medium">
               Upload your first file →
             </Link>
           </div>

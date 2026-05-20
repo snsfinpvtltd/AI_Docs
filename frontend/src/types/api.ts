@@ -37,6 +37,65 @@ export interface ReportRequest {
   dateRangeFrom?: string
   dateRangeTo?: string
   trialId?: string
+  customTemplateId?: string
+}
+
+// ── Custom template builder ───────────────────────────────────────────────────
+
+export type SectionType =
+  | 'ExecutiveSummary'
+  | 'KeyFindings'
+  | 'DataOverview'
+  | 'PatientAnalysis'
+  | 'AdverseEvents'
+  | 'StatisticalInsights'
+  | 'Recommendations'
+  | 'Limitations'
+  | 'Charts'
+  | 'DataTable'
+
+export interface TemplateSection {
+  id: string
+  type: SectionType
+  heading: string
+  aiInstruction?: string
+  isEnabled: boolean
+  order: number
+}
+
+export interface CustomTemplateSummary {
+  id: string
+  name: string
+  description?: string
+  sectionCount: number
+  createdAt: string
+  updatedAt: string
+  isPublic: boolean
+  defaultOutputFormat?: string
+  defaultFilterPrompt?: string
+  isOwner: boolean
+}
+
+export interface CustomTemplateDetail {
+  id: string
+  name: string
+  description?: string
+  sections: TemplateSection[]
+  createdAt: string
+  updatedAt: string
+  isPublic: boolean
+  defaultOutputFormat?: string
+  defaultFilterPrompt?: string
+  isOwner: boolean
+}
+
+export interface CustomTemplateRequest {
+  name: string
+  description?: string
+  isPublic: boolean
+  defaultOutputFormat?: string
+  defaultFilterPrompt?: string
+  sections: TemplateSection[]
 }
 
 export interface ReportSubmitResult {
@@ -51,6 +110,7 @@ export interface JobStatusResult {
   downloadUrl?: string
   progressPercent?: number
   error?: string
+  stageName?: string
 }
 
 export interface UploadSummary {
@@ -73,6 +133,7 @@ export interface ReportJobSummary {
   downloadUrl?: string
   rowCount: number
   promptText?: string
+  reportName?: string
 }
 
 export interface ChartCount {

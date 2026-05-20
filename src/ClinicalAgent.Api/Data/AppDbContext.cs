@@ -7,8 +7,9 @@ public class AppDbContext : DbContext
 {
     public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
 
-    public DbSet<UploadRecord>    Uploads    => Set<UploadRecord>();
-    public DbSet<ReportJobRecord> ReportJobs => Set<ReportJobRecord>();
+    public DbSet<UploadRecord>         Uploads         => Set<UploadRecord>();
+    public DbSet<ReportJobRecord>      ReportJobs      => Set<ReportJobRecord>();
+    public DbSet<ReportTemplateRecord> ReportTemplates => Set<ReportTemplateRecord>();
 
     protected override void OnModelCreating(ModelBuilder mb)
     {
@@ -25,6 +26,14 @@ public class AppDbContext : DbContext
             e.HasIndex(r => r.UserId);
             e.HasIndex(r => r.CreatedAt);
             e.HasIndex(r => r.UploadId);
+        });
+
+        mb.Entity<ReportTemplateRecord>(e =>
+        {
+            e.HasKey(t => t.Id);
+            e.HasIndex(t => t.UserId);
+            e.HasIndex(t => t.UpdatedAt);
+            e.Property(t => t.SectionsJson).HasDefaultValue("[]");
         });
     }
 }

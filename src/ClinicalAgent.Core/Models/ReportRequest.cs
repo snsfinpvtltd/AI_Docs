@@ -8,7 +8,8 @@ public record ReportRequest(
     string? FreeTextPrompt,
     DateOnly? DateRangeFrom,
     DateOnly? DateRangeTo,
-    string? TrialId)
+    string? TrialId,
+    string? CustomTemplateId = null)
 {
     /// <summary>Populated by the controller before calling the orchestrator. Always non-empty.</summary>
     public IReadOnlyList<string> BlobNames { get; init; } = [];

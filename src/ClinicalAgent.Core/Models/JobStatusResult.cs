@@ -6,5 +6,6 @@ public record JobStatusResult(
     ReportStatus Status,
     string? DownloadUrl,
     int? ProgressPercent,
-    string? Error
+    string? Error,
+    string? StageName = null
 );

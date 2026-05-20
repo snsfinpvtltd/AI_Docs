@@ -198,10 +198,24 @@ try
     var app = builder.Build();
 
     // Auto-create SQLite schema on startup (no migrations needed for POC).
+    // Also applies any additive ALTER TABLE changes so new columns don't
+    // require dropping the database when the model evolves.
     using (var scope = app.Services.CreateScope())
     {
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         db.Database.EnsureCreated();
+
+        // Idempotent column additions — safe to run on every startup.
+        var addColumns = new[]
+        {
+            "ALTER TABLE ReportJobs ADD COLUMN ReportName TEXT NULL",
+        };
+        foreach (var sql in addColumns)
+        {
+            try { db.Database.ExecuteSqlRaw(sql); }
+            catch { /* column already exists — ignore */ }
+        }
+
         Log.Information("Database ready: {DbPath}", dbPath);
     }
 

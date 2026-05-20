@@ -55,6 +55,15 @@ function IconDocument(): ReactElement {
   )
 }
 
+function IconTemplate(): ReactElement {
+  return (
+    <svg className="w-[18px] h-[18px] flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+        d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
+    </svg>
+  )
+}
+
 function IconMenu(): ReactElement {
   return (
     <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -92,6 +101,7 @@ const NAV_ITEMS = [
   { to: '/dashboard', label: 'Dashboard',       icon: <IconDashboard /> },
   { to: '/upload',    label: 'Upload Data',     icon: <IconCloudUpload /> },
   { to: '/request',   label: 'New Report',      icon: <IconPlus /> },
+  { to: '/templates', label: 'Templates',       icon: <IconTemplate /> },
   { to: '/uploads',   label: 'Upload History',  icon: <IconUpload /> },
   { to: '/reports',   label: 'Reports History', icon: <IconDocument /> },
 ]

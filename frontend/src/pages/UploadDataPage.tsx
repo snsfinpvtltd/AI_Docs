@@ -7,7 +7,7 @@ import type { UploadSummary } from '../types/api'
 
 type PagePhase =
   | { phase: 'idle' }
-  | { phase: 'uploading'; fileName: string }
+  | { phase: 'uploading'; fileName: string; progress: number }
   | { phase: 'duplicate'; fileName: string; file: File; existing: UploadSummary }
   | { phase: 'success'; fileName: string; blobName: string; rowCount: number; columns: number }
   | { phase: 'error'; fileName: string; message: string }
@@ -38,19 +38,15 @@ export default function UploadDataPage(): ReactElement {
   }, [state]) // refresh list whenever state changes (after successful upload)
 
   const handleFile = useCallback(async (file: File) => {
-    setState({ phase: 'uploading', fileName: file.name })
+    setState({ phase: 'uploading', fileName: file.name, progress: 0 })
     try {
-      const response = await uploadFile(file)
+      const response = await uploadFile(file, false, (pct) => {
+        setState({ phase: 'uploading', fileName: file.name, progress: pct })
+      })
       if (response.kind === 'duplicate') {
         setState({ phase: 'duplicate', fileName: file.name, file, existing: response.existingUpload })
       } else {
-        setState({
-          phase: 'success',
-          fileName: file.name,
-          blobName: response.blobName,
-          rowCount: 0,
-          columns: 0,
-        })
+        setState({ phase: 'success', fileName: file.name, blobName: response.blobName, rowCount: 0, columns: 0 })
       }
     } catch (err) {
       setState({ phase: 'error', fileName: file.name, message: getApiErrorMessage(err) })
@@ -60,9 +56,11 @@ export default function UploadDataPage(): ReactElement {
   const handleForceUpload = async () => {
     if (state.phase !== 'duplicate') return
     const { file } = state
-    setState({ phase: 'uploading', fileName: file.name })
+    setState({ phase: 'uploading', fileName: file.name, progress: 0 })
     try {
-      const response = await uploadFile(file, true)
+      const response = await uploadFile(file, true, (pct) => {
+        setState({ phase: 'uploading', fileName: file.name, progress: pct })
+      })
       if (response.kind === 'success') {
         setState({ phase: 'success', fileName: file.name, blobName: response.blobName, rowCount: 0, columns: 0 })
       }
@@ -77,7 +75,7 @@ export default function UploadDataPage(): ReactElement {
     onDrop: (accepted) => { if (accepted[0]) void handleFile(accepted[0]) },
     accept: { 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'] },
     maxFiles: 1,
-    maxSize: 10 * 1024 * 1024,
+    maxSize: 25 * 1024 * 1024,
     disabled: state.phase === 'uploading' || state.phase === 'success',
   })
 
@@ -118,7 +116,7 @@ export default function UploadDataPage(): ReactElement {
                     <p className="text-sm font-semibold text-[#222222]">
                       {isDragActive ? 'Drop your Excel file here' : 'Drag & drop an Excel file, or click to browse'}
                     </p>
-                    <p className="text-xs text-brand-muted mt-1">.xlsx only · max 10 MB · synthetic / anonymised data only</p>
+                    <p className="text-xs text-brand-muted mt-1">.xlsx only · max 25 MB · synthetic / anonymised data only</p>
                   </div>
                 </>
               )}
@@ -128,16 +126,54 @@ export default function UploadDataPage(): ReactElement {
 
         {/* ── Uploading ────────────────────────────────────────────────────── */}
         {state.phase === 'uploading' && (
-          <div className="rounded-[9px] border border-brand-border bg-white shadow-card p-8 flex flex-col items-center gap-4">
-            <div className="w-14 h-14 rounded-full bg-[#0072ff]/10 flex items-center justify-center">
-              <svg className="w-7 h-7 animate-spin text-[#0072ff]" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-              </svg>
+          <div className="rounded-[9px] border border-brand-border bg-white shadow-card p-6">
+
+            {/* File row */}
+            <div className="flex items-center gap-4 mb-5">
+              <div className="w-11 h-11 rounded-[9px] bg-[#0072ff]/8 flex items-center justify-center flex-shrink-0">
+                <svg className="w-5 h-5 text-[#0072ff]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
+                    d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-semibold text-[#222222] truncate">{state.fileName}</p>
+                <p className="text-xs text-brand-muted mt-0.5">
+                  {state.progress < 100 ? 'Uploading…' : 'Processing & checking for duplicates…'}
+                </p>
+              </div>
+              <span className="text-lg font-bold text-[#0072ff] font-heading tabular-nums flex-shrink-0">
+                {state.progress}%
+              </span>
             </div>
-            <div className="text-center">
-              <p className="text-sm font-semibold text-[#222222]">Uploading &amp; checking for duplicates…</p>
-              <p className="text-xs text-brand-muted mt-1 truncate max-w-sm">{state.fileName}</p>
+
+            {/* Progress track */}
+            <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
+              <div
+                className="h-full rounded-full transition-all duration-200 ease-out"
+                style={{
+                  width: `${state.progress}%`,
+                  background: 'linear-gradient(90deg, #0072ff 0%, #a855f7 100%)',
+                }}
+              />
+            </div>
+
+            {/* Status row */}
+            <div className="flex items-center gap-2 mt-3">
+              {state.progress < 100 ? (
+                <>
+                  <div className="w-1.5 h-1.5 rounded-full bg-[#0072ff] animate-pulse" />
+                  <span className="text-xs text-brand-muted">Transferring file to server…</span>
+                </>
+              ) : (
+                <>
+                  <svg className="w-3.5 h-3.5 animate-spin text-[#0072ff]" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                  </svg>
+                  <span className="text-xs text-brand-muted">Parsing rows &amp; checking for duplicates…</span>
+                </>
+              )}
             </div>
           </div>
         )}

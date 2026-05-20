@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Text.RegularExpressions;
 using ClosedXML.Excel;
 using ClinicalAgent.Api.Data;
 using DocumentFormat.OpenXml;
@@ -49,65 +50,27 @@ internal sealed class LocalReportOrchestrator : IReportOrchestrator
         _logger    = logger;
     }
 
-    /// <summary>Parses the uploaded Excel, generates the requested document format, and stores it for download.</summary>
+    /// <summary>
+    /// Queues a local (no-AI) report job and returns immediately.
+    /// Progress is tracked via GetStatusAsync.
+    /// </summary>
     public async Task<Result<ReportSubmitResult>> SubmitAsync(
         ReportRequest request,
         string userId,
         CancellationToken ct = default)
     {
-        var jobId = Guid.NewGuid().ToString("N")[..12];
-        var ext   = request.OutputFormat switch
+        var jobId      = Guid.NewGuid().ToString("N")[..12];
+        var ext        = request.OutputFormat switch
         {
             OutputFormat.Excel => "xlsx",
             OutputFormat.Pdf   => "pdf",
             _                  => "docx"
         };
         var downloadUrl = $"http://localhost:7001/api/reports/{jobId}/download?format={ext}";
+        var reportName  = BuildReportName(request);
 
-        ParsedData data;
-        try
-        {
-            data = await DownloadAndMergeAsync(request, ct);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to load data for user {UserId} ({Count} blob(s))",
-                userId, request.BlobNames.Count);
-            return Result<ReportSubmitResult>.Fail($"Could not load data files: {ex.Message}");
-        }
+        _jobs[jobId] = new JobStatusResult(jobId, ReportStatus.Processing, null, 5, null, "Preparing…");
 
-        // Apply natural-language row filter from the free-text prompt.
-        var (filteredRows, filterNote) = NaturalLanguageFilter.Apply(request.FreeTextPrompt, data.Headers, data.Rows);
-        if (filterNote is not null)
-        {
-            _logger.LogInformation("NL filter applied for job {JobId}: {Filter} → {Count}/{Total} rows",
-                jobId, filterNote, filteredRows.Count, data.Rows.Count);
-            data = data with { Rows = filteredRows };
-        }
-
-        var charts = ChartGenerator.GenerateCharts(data.Headers, data.Rows);
-        _logger.LogInformation("Generated {Count} chart(s) for job {JobId}", charts.Count, jobId);
-
-        byte[] bytes;
-        string contentType;
-        try
-        {
-            (bytes, contentType) = BuildDocument(data, request.OutputFormat, charts);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Document generation failed for job {JobId}", jobId);
-            return Result<ReportSubmitResult>.Fail($"Document generation failed: {ex.Message}");
-        }
-
-        using var docStream = new MemoryStream(bytes);
-        await _storage.UploadAsync(docStream, BlobContainerNames.Generated, $"{jobId}.{ext}", contentType, ct);
-
-        _logger.LogInformation(
-            "Report {JobId} generated ({Format}, {Rows} rows, {Cols} columns) for user {UserId}",
-            jobId, ext, data.Rows.Count, data.Headers.Count, userId);
-
-        // Persist job record to SQLite.
         await using (var db = await _dbFactory.CreateDbContextAsync(ct))
         {
             var singleBlob = request.BlobNames.Count == 1 ? request.BlobNames[0] : null;
@@ -122,29 +85,165 @@ internal sealed class LocalReportOrchestrator : IReportOrchestrator
                 BlobName     = singleBlob,
                 TemplateType = request.TemplateType,
                 OutputFormat = ext,
-                Status       = "Completed",
+                Status       = "Processing",
                 CreatedAt    = DateTime.UtcNow,
-                CompletedAt  = DateTime.UtcNow,
-                DownloadUrl  = downloadUrl,
+                CompletedAt  = null,
+                DownloadUrl  = null,
                 UserId       = userId,
                 PromptText   = request.FreeTextPrompt,
-                RowCount     = data.Rows.Count,
+                RowCount     = 0,
+                ReportName   = reportName,
             });
             await db.SaveChangesAsync(ct);
         }
 
-        var status = new JobStatusResult(jobId, ReportStatus.Completed, downloadUrl, 100, null);
-        _jobs[jobId] = status;
+        _ = Task.Run(() => RunLocalJobAsync(jobId, ext, downloadUrl, request, userId));
 
-        return Result<ReportSubmitResult>.Ok(new ReportSubmitResult(jobId, downloadUrl, IsAsync: false));
+        _logger.LogInformation("Local report job {JobId} queued for user {UserId}", jobId, userId);
+        return Result<ReportSubmitResult>.Ok(new ReportSubmitResult(jobId, null, IsAsync: true));
     }
 
-    /// <summary>Returns the current job status.</summary>
-    public Task<Result<JobStatusResult>> GetStatusAsync(string jobId, CancellationToken ct = default)
+    /// <summary>Returns the current job status, with DB fallback for page-refresh resilience.</summary>
+    public async Task<Result<JobStatusResult>> GetStatusAsync(string jobId, CancellationToken ct = default)
     {
-        if (_jobs.TryGetValue(jobId, out var status))
-            return Task.FromResult(Result<JobStatusResult>.Ok(status));
-        return Task.FromResult(Result<JobStatusResult>.Fail($"Job '{jobId}' not found."));
+        if (_jobs.TryGetValue(jobId, out var cached))
+            return Result<JobStatusResult>.Ok(cached);
+
+        await using var db = await _dbFactory.CreateDbContextAsync(ct);
+        var job = await db.ReportJobs.AsNoTracking()
+            .FirstOrDefaultAsync(j => j.Id == jobId, ct);
+
+        if (job is null)
+            return Result<JobStatusResult>.Fail($"Job '{jobId}' not found.");
+
+        var rs = job.Status switch
+        {
+            "Completed"  => ReportStatus.Completed,
+            "Failed"     => ReportStatus.Failed,
+            "Processing" => ReportStatus.Processing,
+            _            => ReportStatus.Queued,
+        };
+        return Result<JobStatusResult>.Ok(new JobStatusResult(
+            jobId, rs, job.DownloadUrl,
+            rs == ReportStatus.Completed ? 100 : null,
+            rs == ReportStatus.Failed ? "Generation failed — please try again." : null,
+            rs == ReportStatus.Completed ? "Report ready" : rs.ToString()));
+    }
+
+    // ── Background job ────────────────────────────────────────────────────────
+
+    private async Task RunLocalJobAsync(
+        string jobId,
+        string ext,
+        string downloadUrl,
+        ReportRequest request,
+        string userId)
+    {
+        try
+        {
+            // Stage 1 — load, merge, filter (15 %)
+            SetProgress(jobId, 15, "Loading data files");
+            ParsedData data;
+            try
+            {
+                data = await DownloadAndMergeAsync(request, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to load data for job {JobId}", jobId);
+                await FinishLocalJobAsync(jobId, "Failed", 0, null, $"Could not load data: {ex.Message}");
+                return;
+            }
+
+            SetProgress(jobId, 30, "Applying filters");
+            var (filteredRows, filterNote) = NaturalLanguageFilter.Apply(
+                request.FreeTextPrompt, data.Headers, data.Rows);
+            if (filterNote is not null)
+            {
+                _logger.LogInformation("NL filter applied for job {JobId}: {Filter} → {Count}/{Total} rows",
+                    jobId, filterNote, filteredRows.Count, data.Rows.Count);
+                data = data with { Rows = filteredRows };
+            }
+
+            // Stage 2 — charts (50 %)
+            SetProgress(jobId, 50, "Generating charts");
+            var charts = ChartGenerator.GenerateCharts(data.Headers, data.Rows);
+            _logger.LogInformation("Generated {Count} chart(s) for job {JobId}", charts.Count, jobId);
+
+            // Stage 3 — build document (75 %)
+            SetProgress(jobId, 75, "Building document");
+            byte[] bytes;
+            string contentType;
+            try
+            {
+                (bytes, contentType) = BuildDocument(data, request.OutputFormat, charts);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Document generation failed for job {JobId}", jobId);
+                await FinishLocalJobAsync(jobId, "Failed", data.Rows.Count, null,
+                    $"Document generation failed: {ex.Message}");
+                return;
+            }
+
+            // Stage 4 — upload (92 %)
+            SetProgress(jobId, 92, "Uploading document");
+            using var docStream = new MemoryStream(bytes);
+            await _storage.UploadAsync(docStream, BlobContainerNames.Generated,
+                $"{jobId}.{ext}", contentType, CancellationToken.None);
+
+            _logger.LogInformation("Report {JobId} ({Format}, {Rows} rows) complete for user {UserId}",
+                jobId, ext, data.Rows.Count, userId);
+            await FinishLocalJobAsync(jobId, "Completed", data.Rows.Count, downloadUrl, null);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unexpected error in local job {JobId}", jobId);
+            await FinishLocalJobAsync(jobId, "Failed", 0, null, $"Unexpected error: {ex.Message}");
+        }
+    }
+
+    private void SetProgress(string jobId, int percent, string stageName)
+        => _jobs[jobId] = new JobStatusResult(jobId, ReportStatus.Processing, null, percent, null, stageName);
+
+    private async Task FinishLocalJobAsync(
+        string jobId, string dbStatus, int rowCount, string? downloadUrl, string? error)
+    {
+        var rs = dbStatus == "Completed" ? ReportStatus.Completed : ReportStatus.Failed;
+        _jobs[jobId] = new JobStatusResult(
+            jobId, rs, downloadUrl,
+            dbStatus == "Completed" ? 100 : null,
+            error,
+            dbStatus == "Completed" ? "Report ready" : "Failed");
+
+        try
+        {
+            await using var db = await _dbFactory.CreateDbContextAsync(CancellationToken.None);
+            var job = await db.ReportJobs.FindAsync([jobId]);
+            if (job is null) return;
+            job.Status      = dbStatus;
+            job.CompletedAt = DateTime.UtcNow;
+            job.DownloadUrl = downloadUrl;
+            job.RowCount    = rowCount;
+            await db.SaveChangesAsync(CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to persist job completion for {JobId}", jobId);
+        }
+    }
+
+    private static string BuildReportName(ReportRequest request)
+    {
+        var template = request.TemplateType switch
+        {
+            "patient-summary" => "Patient Summary",
+            "outcome-data"    => "Outcome Data",
+            "full-report"     => "Full Trial Report",
+            _                 => "Clinical Report",
+        };
+        var trial = string.IsNullOrWhiteSpace(request.TrialId) ? "All Trials" : request.TrialId.Trim();
+        return $"{template} – {trial} – {DateTime.UtcNow:dd MMM yyyy}";
     }
 
     // ── Excel loading & merging ───────────────────────────────────────────────
@@ -443,27 +542,32 @@ internal sealed class LocalReportOrchestrator : IReportOrchestrator
                             .FontSize(13).Bold().FontColor(Colors.Blue.Darken3);
                         content.Item().PaddingTop(6).Row(row =>
                         {
-                            foreach (var chart in charts)
+                            for (int ci = 0; ci < charts.Count; ci++)
                             {
+                                var chart = charts[ci];
                                 row.RelativeItem().Column(col =>
                                 {
                                     col.Item().Text(chart.Title).FontSize(9).Bold();
-                                    col.Item().PaddingTop(3).Image(chart.PngBytes).FitWidth();
+                                    col.Item().PaddingTop(3).Height(150)
+                                        .Image(chart.PngBytes).FitArea();
                                 });
-                                row.ConstantItem(10); // gap between charts
+                                if (ci < charts.Count - 1)
+                                    row.ConstantItem(10); // gap between charts only
                             }
                         });
                         content.Item().PaddingTop(12).LineHorizontal(0.5f).LineColor(Colors.Grey.Lighten2);
                         content.Item().PaddingBottom(8);
                     }
 
-                    var colWeights = ChartGenerator.CalcColWeights(data.Headers, data.Rows);
                     content.Item().Table(tbl =>
                     {
                         tbl.ColumnsDefinition(cd =>
                         {
-                            foreach (var w in colWeights)
-                                cd.RelativeColumn(w);
+                            // A4 landscape available ≈ 756.85pt. Use 750pt budget to stay
+                            // safely under that limit regardless of column count.
+                            var colWidth = (float)Math.Floor(750f / Math.Max(1, data.Headers.Count));
+                            foreach (var _ in data.Headers)
+                                cd.ConstantColumn(colWidth);
                         });
 
                         tbl.Header(header =>

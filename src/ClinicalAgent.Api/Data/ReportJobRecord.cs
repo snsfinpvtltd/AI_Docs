@@ -15,4 +15,5 @@ public class ReportJobRecord
     public string   UserId       { get; set; } = string.Empty;
     public string?  PromptText   { get; set; }
     public int      RowCount     { get; set; }
+    public string?  ReportName   { get; set; }
 }

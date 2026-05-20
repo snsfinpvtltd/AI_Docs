@@ -13,7 +13,7 @@ namespace ClinicalAgent.Api.Controllers;
 [Authorize]
 public class UploadsController : ControllerBase
 {
-    private const long MaxFileSizeBytes = 10 * 1024 * 1024;
+    private const long MaxFileSizeBytes = 25 * 1024 * 1024;
     private static readonly string[] AllowedExtensions = [".xlsx"];
 
     private readonly IBlobStorageService _storage;
@@ -55,7 +55,7 @@ public class UploadsController : ControllerBase
             return Problem($"Only {string.Join(", ", AllowedExtensions)} files are accepted.", statusCode: 400);
 
         if (file.Length > MaxFileSizeBytes)
-            return Problem("File exceeds the 10 MB size limit.", statusCode: 400);
+            return Problem("File exceeds the 25 MB size limit.", statusCode: 400);
 
         var userId = User.FindFirst("oid")?.Value ?? User.FindFirst("sub")?.Value ?? "anonymous";
 
